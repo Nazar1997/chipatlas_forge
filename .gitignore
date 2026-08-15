@@ -1,9 +1,14 @@
 # Data in, data out, and everything in between. Only code is tracked here.
-raw/
+# Globbed rather than exact: the workflow creates siblings as it goes --
+# raw_fresh/ while a download verifies, raw_superseded/ after a promotion,
+# out_binmax*/ per signal-track run, smoke/ for end-to-end checks on a slice.
+# Naming them one at a time means git status is never quite clean.
+raw*/
 meta/
 work/
-out/
+out*/
 logs/
+smoke/
 
 __pycache__/
 *.pyc
