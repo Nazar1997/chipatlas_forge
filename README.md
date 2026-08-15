@@ -35,6 +35,7 @@ everything else combined.
 | `shard` | 1 task/org | inflate once, cut into newline-aligned shards |
 | `route` | **1 task/shard** | parse, resolve accessions, partition by bucket |
 | `collect` | **1 task/bucket** | concatenate parts → final BEDs |
+| `binmax` | **1 task/file slice** | overlapping peaks → max-score signal track |
 
 Only `shard` is serial, and only for the reason above. It is a one-time cost:
 shards persist, so changing the grouping and rerunning `route` + `collect` never
@@ -114,6 +115,50 @@ alone accepts a truncated file.
 in `raw_superseded/` rather than deleting, and clears `work/` — shards left
 behind from a previous archive would be silently mixed with new ones, since
 stage 2 addresses shards positionally.
+
+## Peaks vs. signal (`binmax`)
+
+`out/` holds **raw peaks**, so they overlap — every experiment that called a peak
+at a locus contributes its own row:
+
+```
+chr1  9915  10410  SRX24935670  644
+chr1  9919  10288  SRX15914382  377
+chr1  9921  10441  SRX24935673  643
+```
+
+That is a pile of intervals, not a signal. `binmax` collapses it to the maximum
+score over every base, as a 4-column bedGraph of constant-value runs:
+
+```bash
+ORG=hg38 TASKS=100 BIN_SIZE=1 sbatch --array=0-99%50 slurm/05_binmax.sh
+```
+```
+chr1  9903   10466  1328
+chr1  10466  10475  1091
+chr1  10475  10535  937
+```
+
+Disjoint, sorted, zero-coverage gaps omitted. Output goes to
+`out_binmax<bin>/`, so `out/` is untouched and another resolution costs only
+this stage.
+
+**It does not allocate a dense genome.** Painting each peak across its ~570 bases
+would be ~2.2 *trillion* writes over 3.89 B peaks. The maximum is piecewise
+constant and can only change where a peak starts or ends, so ≤ 2n breakpoints
+pin the whole function. Working in that compressed space is **exact at 1 bp** —
+nothing is approximated — while memory becomes O(peaks), each write spans the
+local overlap *depth* rather than a length in bases, and the output is
+run-length encoded for free. Painting in ascending score order makes plain slice
+assignment compute the maximum.
+
+Measured on the full dataset: 3.89 B peaks → 673 M runs, **152 GB → 18.8 GB**,
+slowest task 316 s.
+
+Correctness is pinned against a dense per-base brute force, not by inspection —
+any error in a scheme like this lands on a boundary, exactly where a spot-check
+does not look. Two real files were verified byte-identical to brute force across
+2,000,000 and 4,000,000 consecutive bases.
 
 ## Grouping
 
