@@ -21,8 +21,20 @@ META_COLUMNS = ["srx", "org", "ag_class", "antigen", "ct_class", "celltype"]
 # row carries. Override with --group-by if you want it.
 DEFAULT_GROUP_FIELDS = ("ag_class", "antigen", "ct_class")
 
-# ChIP-Atlas leaves these in as literal strings rather than empty fields.
-PLACEHOLDERS = {"", "NA", "N/A", "-", "No description", "Unclassified"}
+# Genuinely-absent values only.
+#
+# "Unclassified" and "No description" are deliberately NOT here. They look like
+# placeholders but are real ChIP-Atlas antigen classes, sitting in the same
+# column as "Histone" and "ATAC-Seq" and covering 14,221 and 10,449 hg38
+# experiments respectively -- 12.5% of the assembly between them. Folding them
+# into one NA bucket merges two categories the source keeps apart, and merges
+# them with true blanks on top of that.
+#
+# The live experimentList.tab has no empty fields and no dashes at all in these
+# columns, so in practice this set only ever matches "NA" (which maps to itself)
+# -- it is kept for the bundled 2021 CSV and for defensiveness, not because the
+# current source needs it.
+PLACEHOLDERS = {"", "N/A", "-"}
 
 _SAFE = re.compile(r"[^A-Za-z0-9._+-]+")
 

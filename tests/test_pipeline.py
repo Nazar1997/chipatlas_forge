@@ -284,10 +284,19 @@ class TestGroupKeys:
         with pytest.raises(SystemExit, match="claimed by more than one group"):
             manifest.build_for_org(frame, ORG, keys.DEFAULT_GROUP_FIELDS)
 
-    def test_missing_value_spellings_collapse_to_one_token(self):
-        for spelling in ("", "NA", "-", "No description", "Unclassified"):
+    def test_genuinely_absent_values_collapse_to_one_token(self):
+        for spelling in ("", "-", "N/A", "   "):
             assert keys.normalise_field(spelling) == "NA"
         assert keys.normalise_field("H3K27ac") == "H3K27ac"
+
+    def test_unclassified_and_no_description_stay_distinct(self):
+        """They look like placeholders but are real ChIP-Atlas antigen classes,
+        14,221 and 10,449 hg38 experiments -- 12.5% of the assembly. Collapsing
+        them merges two categories the source deliberately keeps apart."""
+        assert keys.normalise_field("Unclassified") == "Unclassified"
+        assert keys.normalise_field("No description") == "No description"
+        assert (keys.group_path("hg38", "Unclassified", "Unclassified", "Blood")
+                != keys.group_path("hg38", "No description", "NA", "Blood"))
 
     def test_slugify_keeps_paths_single_segment(self):
         for name in ("CD4/CD8", "TF (isoform 2)", "α-tubulin", "a  b"):

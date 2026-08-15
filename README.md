@@ -84,13 +84,44 @@ group by reading one bucket — no merge pass.
 most transcription factors), so `collect` appends part-by-part to open handles.
 Peak memory tracks the largest *part*, not the largest group.
 
+## Get current data first
+
+**The archives from the Yandex share are an old release.** Measured against
+ChIP-Atlas upstream:
+
+| | local copy | upstream (2024-11-13) | |
+|---|---|---|---|
+| `allPeaks_light.hg38.05` | 10.24 GB | **22.17 GB** | 2.17× |
+| `allPeaks_light.mm10.05` | 7.70 GB | **15.88 GB** | 2.06× |
+| `chip_atlas_experiment_list` | Oct **2021**, 439,593 exp | `experimentList.tab` Oct **2025**, 845,824 exp | 1.92× |
+
+The metadata gap is the one that silently corrupts results: against the 2021
+zip, 3.2% of hg38 peaks cite accessions it has never heard of, and those peaks
+are dropped — ~48 million at full scale. With `experimentList.tab` the unmapped
+rate falls to **0.21%**.
+
+```bash
+ORGS="hg38 mm10" ./fetch_upstream.sh          # -> raw_fresh/ and meta/
+```
+
+It writes to `raw_fresh/`, not `raw/`, so the pipeline keeps working on whatever
+you have until you swap. Verification is Content-Length **plus a full gzip CRC
+check** — ChIP-Atlas publishes no checksums, and size alone accepts a truncated
+file.
+
 ## Grouping
 
-Default is `(antigen class, antigen, cell type class)` — 3,172 groups for hg38,
-2,334 for mm10. The finer `cell type` (1,698 distinct) would give 10,583 groups;
-it is left out because the exact cell type is still recoverable per-peak from
-the SRX column every output row carries. Override with
+Default is `(antigen class, antigen, cell type class)` — **5,856 groups** for
+hg38 off the live metadata. The finer `cell type` would roughly triple that; it
+is left out because the exact cell type stays recoverable per-peak from the SRX
+column every output row carries. Override with
 `--group-by ag_class antigen ct_class celltype`.
+
+`Unclassified` and `No description` are **kept as real categories**, not folded
+into `NA`. They read like placeholders but are genuine ChIP-Atlas antigen
+classes sitting beside `Histone` and `ATAC-Seq`, covering 14,221 and 10,449
+hg38 experiments — 12.5% of the assembly between them. Only truly absent values
+(`""`, `-`, `N/A`) collapse, and the live metadata contains none of those.
 
 Names are slugified for the filesystem, which is lossy and therefore **not**
 invertible. `manifest.py` refuses to build a manifest where two groups slug to
@@ -109,6 +140,13 @@ array looks like.
 
 ## Notes for this cluster
 
+* **The Arrow ↔ numpy boundary is broken in `myenv`.** pyarrow 20 is built
+  against numpy 2.x and sits next to numpy 1.26.3, so `Array.to_numpy()`,
+  `pa.array(ndarray)` and `table.take(ndarray)` all raise. This is the same
+  break torch 2.5.1 hit with numpy 1.26.3 in the pair builder. `arrow_compat.py`
+  crosses via the buffer protocol instead — zero-copy, and strictly less work
+  than the converter. A guard test fails if anyone reaches for the broken API
+  again, which is important because it works fine on a laptop.
 * Never pass `--mem`: `cpu-e-quick` reports `RealMemory=1` because memory is not
   a scheduled resource, so any request is rejected outright.
 * `/usr/bin/python` is 2.7.5. The scripts name
