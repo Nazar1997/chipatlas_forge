@@ -151,7 +151,9 @@ def route_shard(root: Path, org: str, shard: Path, n_buckets: int,
 
     gid_arrow = group_ids_for(table, lookup)
     mask = pc.greater_equal(gid_arrow, 0)
-    n_unmapped = n_rows - pc.sum(pc.cast(mask, pa.int64())).as_py()
+    # pc.sum over an empty array is null, not 0.
+    n_mapped = pc.sum(pc.cast(mask, pa.int64())).as_py() or 0
+    n_unmapped = n_rows - n_mapped
     if n_unmapped:
         # An accession the manifest never saw -- a peak file newer than the meta
         # dump, usually. Dropped, but counted and reported, never silently.
