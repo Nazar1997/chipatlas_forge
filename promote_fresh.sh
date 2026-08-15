@@ -20,13 +20,21 @@ FRESH="$ROOT/raw_fresh"
 RAW="$ROOT/raw"
 OLD="$ROOT/raw_superseded"
 
+# A full CRC pass inflates the whole archive: ~10 min for hg38, ~7 for mm10,
+# since plain gzip is single-threaded (see shard.py). fetch_upstream.sh already
+# did exactly this check, so VERIFY=0 skips it when the two run back to back.
+# It defaults on because this is the step that is hard to undo.
+VERIFY="${VERIFY:-1}"
+
 for org in $ORGS; do
     f="$FRESH/allPeaks_light.$org.05.bed.gz"
     [[ -f "$f" ]] || { echo "!! missing $f" >&2; exit 1; }
     [[ -f "$f.aria2" ]] && { echo "!! $org still downloading (.aria2 present)" >&2; exit 1; }
-    echo "checking $org gzip CRC ..."
-    pigz -t "$f" || { echo "!! $org failed CRC; not promoting" >&2; exit 1; }
-    echo "  ok  $(numfmt --to=iec "$(stat -c %s "$f")")"
+    if [[ "$VERIFY" == "1" ]]; then
+        echo "checking $org gzip CRC (VERIFY=0 to skip) ..."
+        pigz -t "$f" || { echo "!! $org failed CRC; not promoting" >&2; exit 1; }
+    fi
+    echo "  ok  $org  $(numfmt --to=iec "$(stat -c %s "$f")")"
 done
 
 mkdir -p "$OLD" "$RAW"
