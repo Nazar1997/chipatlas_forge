@@ -45,11 +45,23 @@ for org in $ORGS; do
     mv -v "$FRESH/allPeaks_light.$org.05.bed.gz" "$RAW/"
 done
 
-for stale in "$ROOT/work" "$ROOT/out"; do
-    if [[ -d "$stale" ]] && [[ -n "$(ls -A "$stale" 2>/dev/null)" ]]; then
-        echo "clearing $stale (derived from the superseded archives)"
-        rm -rf "${stale:?}"/*
-    fi
+# Clear derived state for the promoted organisms ONLY.
+#
+# This used to wipe all of work/ and out/. That is correct when an archive is
+# replaced -- stage 2 addresses shards positionally, so leftovers from the old
+# archive would be silently mixed with new ones -- but catastrophic when the
+# promotion merely ADDS assemblies: it would delete finished output for every
+# organism already built, which at the time of writing was 152 GB of hg38 and
+# mm10 BEDs that have nothing to do with this promotion.
+for org in $ORGS; do
+    for stale in "$ROOT/work/shards/$org" "$ROOT/work/parts/$org" \
+                 "$ROOT/work/stats/$org" "$ROOT/work/collect_stats/$org" \
+                 "$ROOT/work/manifest/$org" "$ROOT/out/$org"; do
+        if [[ -d "$stale" ]]; then
+            echo "clearing $stale (derived from the superseded $org archive)"
+            rm -rf "${stale:?}"
+        fi
+    done
 done
 
 echo
