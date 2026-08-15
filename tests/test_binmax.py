@@ -8,6 +8,7 @@ compression is ever wrong it will be wrong at a boundary, which is exactly what
 a dense comparison catches and a spot-check does not.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -16,6 +17,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from chipatlas_forge import binmax  # noqa: E402
 from chipatlas_forge.binmax import max_runs  # noqa: E402
 
 
@@ -142,3 +144,81 @@ class TestRunEncoding:
                               np.array([42], dtype=np.int32), bin_size=128)
         assert len(rs) == 1 and rv[0] == 42
         assert rs[0] == 1000 // 128 and re[0] == rs[0] + 1
+
+
+class TestCommandLine:
+    """Drive main() the way SLURM does.
+
+    The unit tests above call max_runs and convert_file directly, so a real
+    NameError on the last line of main() -- writing the stats file, after every
+    output had already been produced -- survived them and failed 200 array tasks.
+    Anything the batch scripts invoke has to be exercised through its entry point.
+    """
+
+    @staticmethod
+    def _project(tmp_path, n_files=3):
+        rng = np.random.default_rng(5)
+        root = tmp_path / "forge"
+        for i in range(n_files):
+            path = root / "out" / "hg38" / "Histone" / ("T%d" % i) / "H3K27ac.bed"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            rows = []
+            for chrom in ("chr1", "chr2"):
+                starts = np.sort(rng.integers(0, 100_000, size=400))
+                for s in starts:
+                    rows.append("%s\t%d\t%d\tSRX%d\t%d\n"
+                                % (chrom, s, s + rng.integers(50, 800),
+                                   rng.integers(1, 999), rng.integers(1, 3000)))
+            path.write_text("".join(rows))
+        return root
+
+    def test_end_to_end_writes_outputs_and_stats(self, tmp_path):
+        root = self._project(tmp_path)
+        assert binmax.main(["--root", str(root), "--org", "hg38",
+                            "--task", "all", "--bin-size", "1"]) == 0
+
+        produced = sorted((root / "out_binmax1").rglob("*.bedgraph"))
+        assert len(produced) == 3
+        for path in produced:
+            assert path.stat().st_size > 0
+
+        stats = sorted((root / "work" / "binmax_stats" / "hg38").glob("*.json"))
+        assert stats, "stats file was not written"
+        payload = json.loads(stats[0].read_text())
+        assert payload["files"] == 3 and payload["peaks"] > 0 and payload["runs"] > 0
+
+    def test_striding_covers_every_file_exactly_once(self, tmp_path):
+        """A mismatch between --tasks and the array width silently skips files."""
+        root = self._project(tmp_path, n_files=7)
+        for task in range(4):
+            binmax.main(["--root", str(root), "--org", "hg38",
+                         "--task", str(task), "--tasks", "4"])
+        produced = sorted((root / "out_binmax1").rglob("*.bedgraph"))
+        assert len(produced) == 7
+
+    def test_task_past_the_end_is_a_noop_not_a_crash(self, tmp_path):
+        root = self._project(tmp_path, n_files=2)
+        assert binmax.main(["--root", str(root), "--org", "hg38",
+                            "--task", "9", "--tasks", "4"]) == 0
+
+    def test_output_rows_are_disjoint_and_ordered(self, tmp_path):
+        root = self._project(tmp_path, n_files=1)
+        binmax.main(["--root", str(root), "--org", "hg38", "--task", "all"])
+        path = next((root / "out_binmax1").rglob("*.bedgraph"))
+        per_chrom = {}
+        for line in path.read_text().splitlines():
+            chrom, start, end, value = line.split("\t")
+            start, end, value = int(start), int(end), int(value)
+            assert start < end and value > 0
+            previous = per_chrom.get(chrom)
+            if previous is not None:
+                assert previous <= start, "%s overlaps or is unsorted" % chrom
+            per_chrom[chrom] = end
+        assert set(per_chrom) == {"chr1", "chr2"}
+
+    def test_bin_size_picks_its_own_output_root(self, tmp_path):
+        root = self._project(tmp_path, n_files=1)
+        binmax.main(["--root", str(root), "--org", "hg38", "--task", "all",
+                     "--bin-size", "128"])
+        assert (root / "out_binmax128").exists()
+        assert not (root / "out_binmax1").exists()

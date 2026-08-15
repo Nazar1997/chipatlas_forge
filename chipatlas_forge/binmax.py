@@ -245,7 +245,7 @@ def main(argv=None) -> int:
             totals[key] += stats[key]
 
     totals["seconds"] = round(time.time() - started, 1)
-    stats_dir = args.root / "work" / "binmax_stats" / org
+    stats_dir = args.root / "work" / "binmax_stats" / args.org
     stats_dir.mkdir(parents=True, exist_ok=True)
     (stats_dir / ("task_%04d.json" % index)).write_text(json.dumps(totals))
     print("done: %(files)d files  %(peaks)d peaks -> %(runs)d runs  %(seconds)ss"
