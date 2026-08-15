@@ -43,8 +43,11 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
+
+from . import arrow_compat as compat
 
 BED_COLUMNS = ["chrom", "start", "end", "srx", "score"]
 
@@ -113,25 +116,30 @@ def read_shard(path: Path, block_size: int) -> tuple:
     return table, len(bad)
 
 
-def group_ids_for(table: pa.Table, lookup: dict) -> np.ndarray:
-    """Per-row group id, -1 where the accession is not in the manifest.
+def group_ids_for(table: pa.Table, lookup: dict) -> pa.Array:
+    """Per-row group id as an Arrow Int32Array, -1 where the accession is unknown.
 
-    Chunks are handled one at a time because each chunk of a dictionary column
-    carries its own dictionary; unifying them first would cost more than just
-    doing the (tiny) per-chunk lookup.
+    This is where dictionary encoding pays off. Each chunk's ``dictionary`` holds
+    only the *distinct* accessions in that chunk -- tens of thousands, against
+    millions of rows -- so the Python-level dict lookup runs once per distinct
+    accession, and the per-row expansion is a single Arrow ``take``.
+
+    Chunks are handled one at a time because each carries its own dictionary;
+    unifying them first would cost more than the per-chunk lookup does.
     """
     out = []
     for chunk in table.column("srx").chunks:
         values = chunk.dictionary.to_pylist()
-        lut = np.fromiter((lookup.get(v, -1) for v in values),
-                          dtype=np.int32, count=len(values))
+        lut = pa.array([lookup.get(v, -1) for v in values], type=pa.int32())
         indices = chunk.indices
         if indices.null_count:
-            # Route nulls to a sentinel slot that maps to -1, i.e. unmapped.
-            indices = indices.fill_null(len(lut))
-            lut = np.append(lut, np.int32(-1))
-        out.append(lut[indices.to_numpy(zero_copy_only=False).astype(np.int64)])
-    return np.concatenate(out) if out else np.empty(0, dtype=np.int32)
+            # Route nulls at a sentinel slot that maps to -1, i.e. unmapped.
+            lut = pa.concat_arrays([lut, pa.array([-1], type=pa.int32())])
+            indices = indices.fill_null(len(values))
+        out.append(lut.take(indices))
+    if not out:
+        return pa.array([], type=pa.int32())
+    return pa.concat_arrays(out)
 
 
 def route_shard(root: Path, org: str, shard: Path, n_buckets: int,
@@ -141,20 +149,24 @@ def route_shard(root: Path, org: str, shard: Path, n_buckets: int,
     table, n_bad = read_shard(shard, block_size)
     n_rows = table.num_rows
 
-    gid = group_ids_for(table, lookup)
-    mapped = gid >= 0
-    n_unmapped = int((~mapped).sum())
+    gid_arrow = group_ids_for(table, lookup)
+    mask = pc.greater_equal(gid_arrow, 0)
+    n_unmapped = n_rows - pc.sum(pc.cast(mask, pa.int64())).as_py()
     if n_unmapped:
-        table = table.filter(pa.array(mapped))
-        gid = gid[mapped]
+        # An accession the manifest never saw -- a peak file newer than the meta
+        # dump, usually. Dropped, but counted and reported, never silently.
+        table = table.filter(mask)
+        gid_arrow = gid_arrow.filter(mask)
 
-    table = table.append_column("group_id", pa.array(gid, type=pa.int32()))
+    table = table.append_column("group_id", gid_arrow)
+    gid = compat.to_numpy(gid_arrow, np.int32)
     bucket = (gid % n_buckets).astype(np.int32)
 
-    # Stable, so rows keep the genomic order they arrived in. numpy uses a radix
-    # sort here (integer keys, stable), so this is linear rather than n log n.
-    order = np.argsort(bucket, kind="stable")
-    table = table.take(pa.array(order))
+    # Stable, so rows keep the genomic order they arrived in -- the property the
+    # whole no-sort design rests on. numpy uses a radix sort for integer keys,
+    # so this is linear rather than n log n.
+    order = np.argsort(bucket, kind="stable").astype(np.int64)
+    table = table.take(compat.to_arrow(order, pa.int64()))
     edges = np.searchsorted(bucket[order], np.arange(n_buckets + 1))
 
     tag = shard.name.split(".")[0]           # shard_0007

@@ -212,6 +212,64 @@ class TestEndToEnd:
                 assert len(line.split("\t")) == 5, "%s has a torn line" % path.name
 
 
+class TestMetadataSource:
+    """experimentList.tab is the default source; the bundled zip is a fallback.
+
+    The zip in the Yandex share is stamped October 2021 and misses ~3.2% of the
+    accessions the peak archives cite -- ~48 million peaks at full scale. The
+    live list carries 845,824 experiments against the zip's 439,593.
+    """
+
+    def _write_tab(self, meta_dir, rows):
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        with open(meta_dir / manifest.LIVE_LIST, "w", encoding="latin-1") as fh:
+            for row in rows:
+                fh.write("\t".join(row) + "\n")
+
+    def test_ragged_trailing_columns_do_not_shift_the_fields(self, tmp_path):
+        """The free-text metadata column contains tabs of its own, so rows have
+        varying field counts. A parser told to expect six columns misaligns."""
+        self._write_tab(tmp_path / "meta", [
+            ["SRX1", "hg38", "Histone", "H3K27ac", "Blood", "K562",
+             "desc", "logs", "a title with\ttabs\tinside", "meta=1 || meta=2"],
+            ["SRX2", "hg38", "Histone", "H3K4me3", "Liver", "HepG2"],
+        ])
+        frame = manifest.read_experiment_list(tmp_path / "meta")
+        assert list(frame["srx"]) == ["SRX1", "SRX2"]
+        assert list(frame["antigen"]) == ["H3K27ac", "H3K4me3"]
+        assert list(frame["ct_class"]) == ["Blood", "Liver"]
+
+    def test_rows_too_short_to_identify_are_skipped(self, tmp_path):
+        self._write_tab(tmp_path / "meta", [
+            ["SRX1", "hg38", "Histone", "H3K27ac", "Blood", "K562"],
+            ["SRX2", "hg38", "Histone"],            # truncated, unusable
+        ])
+        frame = manifest.read_experiment_list(tmp_path / "meta")
+        assert list(frame["srx"]) == ["SRX1"]
+
+    def test_live_list_wins_over_the_stale_zip(self, tmp_path, project):
+        """Both present: the fresher one must be chosen without being asked."""
+        root, _, _ = project
+        assert (root / "meta" / manifest.BUNDLED_ZIP).exists()
+        self._write_tab(root / "meta", [
+            ["SRXFRESH", "hg38", "Histone", "H3K9me3", "Bone", "cell"],
+        ])
+        frame = manifest.read_experiment_list(root / "meta")
+        assert list(frame["srx"]) == ["SRXFRESH"]
+
+        forced = manifest.read_experiment_list(root / "meta", "bundled")
+        assert "SRXFRESH" not in set(forced["srx"])
+
+    def test_cp1252_bytes_do_not_raise(self, tmp_path):
+        """The real files carry smart quotes; utf-8 decoding dies on them."""
+        meta = tmp_path / "meta"
+        meta.mkdir()
+        with open(meta / manifest.LIVE_LIST, "wb") as fh:
+            fh.write(b"SRX1\thg38\tHistone\tH3K27ac\tBlood\tK562\ttitle \x91quoted\x92\n")
+        frame = manifest.read_experiment_list(meta)
+        assert list(frame["antigen"]) == ["H3K27ac"]
+
+
 class TestGroupKeys:
     def test_slug_collisions_are_refused_not_merged(self):
         """Two antigens slugging to one path would silently share a BED."""

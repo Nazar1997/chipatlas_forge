@@ -24,39 +24,86 @@ from .keys import (DEFAULT_GROUP_FIELDS, META_COLUMNS, group_path,
                    normalise_field)
 
 
-def read_experiment_list(meta_dir: Path) -> pd.DataFrame:
-    """The six identifying columns of chip_atlas_experiment_list.csv.
+# Everything here reads as latin-1, never utf-8. The ChIP-Atlas metadata carries
+# cp1252 smart quotes in free-text titles (byte 0x91 at offset 6899 of the 2021
+# CSV, for one) and utf-8 decoding raises on them. latin-1 cannot fail -- every
+# byte is a valid code point -- and the six columns kept here are ASCII in
+# practice, so nothing is mangled. errors="replace" would instead corrupt an
+# antigen name silently.
+ENCODING = "latin-1"
+
+LIVE_LIST = "experimentList.tab"
+BUNDLED_ZIP = "chip_atlas_experiment_list.zip"
+
+
+def read_live_list(path: Path) -> pd.DataFrame:
+    """Parse ChIP-Atlas's canonical experimentList.tab.
+
+    Fetch or refresh it with:
+        curl -o meta/experimentList.tab \\
+             https://chip-atlas.dbcls.jp/data/metadata/experimentList.tab
+
+    Split manually rather than with pandas because the file is *ragged*: it has
+    no header, and the trailing free-text metadata column contains tabs of its
+    own, so rows have varying field counts and any parser told to expect six
+    columns will either error or misalign. ``split("\\t", 6)`` stops after the
+    six fields that matter and leaves the rest as one blob.
+    """
+    rows = []
+    with open(path, encoding=ENCODING) as fh:
+        for line in fh:
+            parts = line.rstrip("\n").split("\t", len(META_COLUMNS))
+            if len(parts) >= len(META_COLUMNS):
+                rows.append(parts[:len(META_COLUMNS)])
+    return pd.DataFrame(rows, columns=META_COLUMNS)
+
+
+def read_bundled_zip(path: Path) -> pd.DataFrame:
+    """The six identifying columns of the bundled chip_atlas_experiment_list.zip.
 
     Read straight out of the zip -- the CSV expands to 450 MB and nothing else
     needs it on disk.
-
-    ``encoding="latin-1"``, not utf-8: the file carries cp1252 smart quotes in
-    free-text titles (byte 0x91 at offset 6899, for one) and utf-8 decoding dies
-    on them. latin-1 cannot fail -- every byte is a valid code point -- and the
-    six columns we keep are ASCII in practice, so nothing is mangled. The
-    alternative, errors="replace", would silently corrupt an antigen name.
     """
-    archive = meta_dir / "chip_atlas_experiment_list.zip"
-    if not archive.exists():
-        raise SystemExit("missing %s -- fetch the meta/ folder first" % archive)
-
-    with zipfile.ZipFile(archive) as zf:
+    with zipfile.ZipFile(path) as zf:
         inner = [n for n in zf.namelist() if n.endswith(".csv")]
         if len(inner) != 1:
-            raise SystemExit("expected one CSV in %s, found %r" % (archive, inner))
+            raise SystemExit("expected one CSV in %s, found %r" % (path, inner))
         with zf.open(inner[0]) as fh:
-            frame = pd.read_csv(
-                fh,
-                usecols=range(len(META_COLUMNS)),
-                names=META_COLUMNS,
-                header=0,
-                dtype=str,
-                keep_default_na=False,
-                encoding="latin-1",
-                engine="c",
-                on_bad_lines="warn",
+            return pd.read_csv(
+                fh, usecols=range(len(META_COLUMNS)), names=META_COLUMNS,
+                header=0, dtype=str, keep_default_na=False,
+                encoding=ENCODING, engine="c", on_bad_lines="warn",
             )
-    return frame
+
+
+def read_experiment_list(meta_dir: Path, source: str = "auto") -> pd.DataFrame:
+    """Accession metadata, preferring the live list over the bundled zip.
+
+    The zip that ships in the Yandex share is stamped **October 2021** and is
+    badly out of date against the peak archives: 3.2% of hg38 peaks cite
+    accessions it has never heard of, which at full scale is ~48 million peaks
+    dropped. The live experimentList.tab (2025-10-01) carries 845,824
+    experiments against the zip's 439,593 -- 197,044 for hg38 rather than
+    103,765 -- and closes that gap.
+
+    So `auto` takes the live file when it is present and falls back to the zip
+    with a warning when it is not.
+    """
+    live, bundled = meta_dir / LIVE_LIST, meta_dir / BUNDLED_ZIP
+
+    if source in ("auto", "live") and live.exists():
+        print("  source: %s (%.0f MB)" % (live.name, live.stat().st_size / 1e6))
+        return read_live_list(live)
+    if source == "live":
+        raise SystemExit("missing %s; download it from chip-atlas.dbcls.jp" % live)
+
+    if not bundled.exists():
+        raise SystemExit("no metadata in %s -- expected %s or %s"
+                         % (meta_dir, LIVE_LIST, BUNDLED_ZIP))
+    print("  source: %s -- this snapshot is from 2021 and misses ~3%% of "
+          "accessions in current peak archives; prefer %s"
+          % (bundled.name, LIVE_LIST), file=sys.stderr)
+    return read_bundled_zip(bundled)
 
 
 def build_for_org(frame: pd.DataFrame, org: str, group_fields) -> tuple:
@@ -123,10 +170,14 @@ def main(argv=None) -> int:
     parser.add_argument("--org", nargs="+", default=["hg38", "mm10"])
     parser.add_argument("--group-by", nargs="+", default=list(DEFAULT_GROUP_FIELDS),
                         choices=["ag_class", "antigen", "ct_class", "celltype"])
+    parser.add_argument("--meta-source", choices=["auto", "live", "bundled"],
+                        default="auto",
+                        help="'live' requires meta/experimentList.tab; 'bundled' "
+                             "forces the stale 2021 zip")
     args = parser.parse_args(argv)
 
     print("reading experiment list ...", flush=True)
-    frame = read_experiment_list(args.root / "meta")
+    frame = read_experiment_list(args.root / "meta", args.meta_source)
     print("  %d experiments across %d assemblies"
           % (len(frame), frame["org"].nunique()))
 

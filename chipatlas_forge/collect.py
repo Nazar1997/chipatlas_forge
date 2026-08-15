@@ -30,8 +30,11 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
+
+from . import arrow_compat as compat
 
 BED_COLUMNS = ["chrom", "start", "end", "srx", "score"]
 
@@ -108,10 +111,11 @@ def collect_bucket(root: Path, org: str, bucket: int, n_buckets: int,
         table = pq.read_table(part)
         if table.num_rows == 0:
             continue
-        gid = table.column("group_id").to_numpy()
+        gid = compat.to_numpy(table.column("group_id"), np.int32)
         # Stable, so the genomic order inside each group survives the regrouping.
-        order = np.argsort(gid, kind="stable")
-        table = table.take(order).drop_columns(["group_id"]).select(BED_COLUMNS)
+        order = np.argsort(gid, kind="stable").astype(np.int64)
+        table = (table.take(compat.to_arrow(order, pa.int64()))
+                      .drop_columns(["group_id"]).select(BED_COLUMNS))
         sorted_gid = gid[order]
 
         # Contiguous run per group: one slice and one C++ CSV write each, rather
