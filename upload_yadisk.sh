@@ -27,7 +27,9 @@ ROOT="${ROOT:-$HOME/HyenaProject/data/chipatlas_forge}"
 REMOTE="${REMOTE:-disk:/chipatlas_05/2024-11_q05}"
 API="https://cloud-api.yandex.net/v1/disk"
 TOKEN_FILE="${TOKEN_FILE:-$HOME/.yandex_oauth}"
-MAX_TRIES=3
+# Generous, because each retry is a fresh roll of the uploader-host dice rather
+# than a repeat of the same failing thing.
+MAX_TRIES=8
 
 [[ -r "$TOKEN_FILE" ]] || { echo "no OAuth token at $TOKEN_FILE" >&2; exit 1; }
 TOKEN=$(tr -d ' \n' < "$TOKEN_FILE")
@@ -64,9 +66,20 @@ put() {
         if [[ -z "$href" ]]; then
             echo "   no upload href; retrying in 30s" >&2; sleep 30; (( try++ )); continue
         fi
-        # A one-time href on an uploader*.disk.yandex.net host. There is no
-        # resume: a failed PUT restarts from zero, hence the md5 skip above.
-        code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 21600 -T "$local_path" "$href")
+        # A one-time href on an uploader*.disk.yandex.net host, and WHICH host
+        # you get decides everything. Throughput varies by orders of magnitude
+        # between them, and a bad one does not merely crawl -- it accepts the
+        # connection and then sends nothing at all. Observed: uploader746klg
+        # held a 329 MB PUT for 13 minutes at wchar=0, while uploader13klg has
+        # done 20 MB/s on a 3.8 GB file.
+        #
+        # So the real defence is a stall detector, not a timeout: abort once
+        # throughput sits under 100 KB/s for 2 minutes, then loop round and ask
+        # for a NEW href, which usually lands on a different host. --max-time is
+        # only a final ceiling -- at 20 MB/s the 22 GB archives need ~18 min.
+        code=$(curl -sS -o /dev/null -w '%{http_code}' \
+                    --speed-limit 100000 --speed-time 120 \
+                    --max-time 7200 -T "$local_path" "$href")
         if [[ "$code" == "201" || "$code" == "202" ]]; then
             sleep 5                                   # let Yandex finish hashing
             if [[ "$(remote_md5 "$remote_path")" == "$want" ]]; then
