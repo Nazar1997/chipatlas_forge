@@ -16,32 +16,55 @@ ORG="${ORG:?set ORG=hg38 or ORG=mm10}"
 # Submitted before the shard count is known, so it has to be an upper bound:
 # tasks past the end exit 0 immediately (route.resolve_shards). Too LOW is the
 # dangerous direction -- shards silently never routed and BEDs quietly short --
-# so this sits far above the ~119 the current hg38 archive needs at CHUNK=1G,
-# and well under SLURM's MaxArraySize of 1001. collect refuses to run if any
-# shard was missed, so a bad value fails loudly rather than truncating.
-MAX_SHARDS="${MAX_SHARDS:-400}"
-THROTTLE="${THROTTLE:-100}"
+# but too high is not free either, because **every pending array task counts
+# against the QOS submit limit** (MaxSubmitJobsPU=500 on `normal` here). A
+# 401-wide array consumed the whole budget on the first attempt and the collect
+# array simply failed to submit.
+#
+# At CHUNK=2G the current archives need ~60 shards for hg38 and ~43 for mm10, so
+# 80 leaves real margin and keeps the whole plan inside the cap. collect refuses
+# to run if any shard was missed, so an undersized value fails loudly rather
+# than truncating.
+MAX_SHARDS="${MAX_SHARDS:-80}"
+THROTTLE="${THROTTLE:-50}"
 
 cd "$ROOT"
 
+# --- stay inside the QOS submit limit -------------------------------------
+# Exceeding it does not queue, it *rejects*, and sbatch keeps going -- so a
+# chain can end up with its first jobs submitted and its last ones missing,
+# which looks like a pipeline that ran and produced nothing.
+planned=$(( 2 + (MAX_SHARDS + 1) + BUCKETS ))
+limit=$(sacctmgr -n show qos normal format=MaxSubmitJobsPU 2>/dev/null | tr -d ' ')
+in_queue=$(squeue -u "$USER" -h -r 2>/dev/null | wc -l)
+if [[ -n "$limit" && "$limit" =~ ^[0-9]+$ ]]; then
+    if (( in_queue + planned > limit )); then
+        echo "refusing to submit: $planned jobs on top of $in_queue already queued" >&2
+        echo "would exceed the QOS limit of $limit." >&2
+        echo "Wait for the queue to drain, or lower BUCKETS / MAX_SHARDS." >&2
+        exit 1
+    fi
+    echo "submit budget: $planned planned + $in_queue queued of $limit"
+fi
+
 manifest=$(sbatch --parsable --partition="$PARTITION" \
-    --export=ALL,ORGS="$ORG" "$HERE/01_manifest.sh")
+    --export=ALL,FORGE_ENV="$HERE/_env.sh",ORGS="$ORG" "$HERE/01_manifest.sh")
 echo "manifest : $manifest"
 
 shard=$(sbatch --parsable --partition="$PARTITION" \
-    --export=ALL,ORG="$ORG",CHUNK="$CHUNK" "$HERE/02_shard.sh")
+    --export=ALL,FORGE_ENV="$HERE/_env.sh",ORG="$ORG",CHUNK="$CHUNK" "$HERE/02_shard.sh")
 echo "shard    : $shard"
 
 route=$(sbatch --parsable --partition="$PARTITION" \
     --dependency="afterok:$manifest:$shard" \
     --array="0-${MAX_SHARDS}%${THROTTLE}" \
-    --export=ALL,ORG="$ORG",BUCKETS="$BUCKETS" "$HERE/03_route.sh")
+    --export=ALL,FORGE_ENV="$HERE/_env.sh",ORG="$ORG",BUCKETS="$BUCKETS" "$HERE/03_route.sh")
 echo "route    : $route  (array 0-${MAX_SHARDS}%${THROTTLE})"
 
 collect=$(sbatch --parsable --partition="$PARTITION" \
     --dependency="afterok:$route" \
     --array="0-$((BUCKETS - 1))%${THROTTLE}" \
-    --export=ALL,ORG="$ORG",BUCKETS="$BUCKETS",COMPRESS="${COMPRESS:-none}" \
+    --export=ALL,FORGE_ENV="$HERE/_env.sh",ORG="$ORG",BUCKETS="$BUCKETS",COMPRESS="${COMPRESS:-none}" \
     "$HERE/04_collect.sh")
 echo "collect  : $collect  (array 0-$((BUCKETS - 1))%${THROTTLE})"
 
