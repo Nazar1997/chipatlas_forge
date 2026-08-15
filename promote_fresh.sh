@@ -1,0 +1,49 @@
+#!/bin/bash
+#
+# Swap the freshly-downloaded archives into raw/ once they verify.
+#
+# Nothing is deleted. The superseded archives move to raw_superseded/ so the
+# swap is reversible and so a half-finished download can never quietly replace
+# good data -- every file is re-checked here even though fetch_upstream.sh
+# already checked it, because this is the step that is hard to undo.
+#
+# Any existing work/ and out/ are cleared: they were derived from the old
+# archives, and shards left behind would be silently mixed with new ones by
+# stage 2, which indexes shards positionally.
+#
+#   ORGS="hg38 mm10" ./promote_fresh.sh
+set -uo pipefail
+
+ROOT="${ROOT:-$HOME/HyenaProject/data/chipatlas_forge}"
+ORGS="${ORGS:-hg38 mm10}"
+FRESH="$ROOT/raw_fresh"
+RAW="$ROOT/raw"
+OLD="$ROOT/raw_superseded"
+
+for org in $ORGS; do
+    f="$FRESH/allPeaks_light.$org.05.bed.gz"
+    [[ -f "$f" ]] || { echo "!! missing $f" >&2; exit 1; }
+    [[ -f "$f.aria2" ]] && { echo "!! $org still downloading (.aria2 present)" >&2; exit 1; }
+    echo "checking $org gzip CRC ..."
+    pigz -t "$f" || { echo "!! $org failed CRC; not promoting" >&2; exit 1; }
+    echo "  ok  $(numfmt --to=iec "$(stat -c %s "$f")")"
+done
+
+mkdir -p "$OLD" "$RAW"
+for org in $ORGS; do
+    if [[ -f "$RAW/allPeaks_light.$org.05.bed.gz" ]]; then
+        mv -v "$RAW/allPeaks_light.$org.05.bed.gz" "$OLD/"
+    fi
+    mv -v "$FRESH/allPeaks_light.$org.05.bed.gz" "$RAW/"
+done
+
+for stale in "$ROOT/work" "$ROOT/out"; do
+    if [[ -d "$stale" ]] && [[ -n "$(ls -A "$stale" 2>/dev/null)" ]]; then
+        echo "clearing $stale (derived from the superseded archives)"
+        rm -rf "${stale:?}"/*
+    fi
+done
+
+echo
+echo "promoted. superseded archives kept in $OLD -- delete when you are happy."
+ls -la "$RAW"

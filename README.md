@@ -102,12 +102,18 @@ rate falls to **0.21%**.
 
 ```bash
 ORGS="hg38 mm10" ./fetch_upstream.sh          # -> raw_fresh/ and meta/
+ORGS="hg38 mm10" ./promote_fresh.sh           # raw_fresh/ -> raw/, once verified
 ```
 
-It writes to `raw_fresh/`, not `raw/`, so the pipeline keeps working on whatever
-you have until you swap. Verification is Content-Length **plus a full gzip CRC
-check** — ChIP-Atlas publishes no checksums, and size alone accepts a truncated
-file.
+`fetch_upstream.sh` writes to `raw_fresh/`, not `raw/`, so the pipeline keeps
+working on whatever you have until you swap. Verification is Content-Length
+**plus a full gzip CRC check** — ChIP-Atlas publishes no checksums, and size
+alone accepts a truncated file.
+
+`promote_fresh.sh` re-checks each archive before moving it, keeps the old ones
+in `raw_superseded/` rather than deleting, and clears `work/` — shards left
+behind from a previous archive would be silently mixed with new ones, since
+stage 2 addresses shards positionally.
 
 ## Grouping
 
