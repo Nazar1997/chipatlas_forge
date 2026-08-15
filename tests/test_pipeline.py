@@ -173,6 +173,27 @@ class TestEndToEnd:
 
         pd.testing.assert_frame_equal(first, second)
 
+    def test_collect_refuses_to_build_from_a_partial_route(self, project):
+        """A dead route task makes every group it touched come out short, with
+        no gap and no error -- output that looks entirely plausible."""
+        root, _, _ = project
+        manifest.main(["--root", str(root), "--org", ORG])
+        shard.main(["--root", str(root), "--org", ORG, "--chunk-size", "64K"])
+        route.main(["--root", str(root), "--org", ORG, "--shard", "all",
+                    "--buckets", "8"])
+
+        stats = sorted((root / "work" / "stats" / ORG).glob("*.json"))
+        assert len(stats) > 1, "need several shards for this to mean anything"
+        stats[0].unlink()                      # as if that array task had died
+
+        with pytest.raises(SystemExit, match="never routed"):
+            collect.main(["--root", str(root), "--org", ORG, "--bucket", "all",
+                          "--buckets", "8"])
+
+        # and the escape hatch still works, for when that is really what you want
+        collect.main(["--root", str(root), "--org", ORG, "--bucket", "all",
+                      "--buckets", "8", "--allow-partial"])
+
     def test_shards_concatenate_back_to_the_original(self, project):
         """The invariant the whole no-sort design rests on.
 

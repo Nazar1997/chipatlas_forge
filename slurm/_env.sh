@@ -8,7 +8,11 @@ PY="${PY:-$HOME/.conda/envs/myenv/bin/python}"
 ROOT="${ROOT:-$HOME/HyenaProject/data/chipatlas_forge}"
 PARTITION="${PARTITION:-cpu-e-quick}"
 BUCKETS="${BUCKETS:-128}"
-CHUNK="${CHUNK:-512M}"
+# 1G of text per shard puts the current archives at ~119 shards for hg38 and
+# ~85 for mm10 -- close to one full round at THROTTLE=100. 512M would give 238
+# and 171, which is more scheduling churn for no gain. Each route task then
+# holds ~30M rows, a few GB.
+CHUNK="${CHUNK:-1G}"
 
 export PYTHONPATH="$ROOT:${PYTHONPATH:-}"
 mkdir -p "$ROOT/logs"

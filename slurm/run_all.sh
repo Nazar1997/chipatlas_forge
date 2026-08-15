@@ -13,7 +13,13 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/_env.sh"
 ORG="${ORG:?set ORG=hg38 or ORG=mm10}"
-MAX_SHARDS="${MAX_SHARDS:-199}"
+# Submitted before the shard count is known, so it has to be an upper bound:
+# tasks past the end exit 0 immediately (route.resolve_shards). Too LOW is the
+# dangerous direction -- shards silently never routed and BEDs quietly short --
+# so this sits far above the ~119 the current hg38 archive needs at CHUNK=1G,
+# and well under SLURM's MaxArraySize of 1001. collect refuses to run if any
+# shard was missed, so a bad value fails loudly rather than truncating.
+MAX_SHARDS="${MAX_SHARDS:-400}"
 THROTTLE="${THROTTLE:-100}"
 
 cd "$ROOT"

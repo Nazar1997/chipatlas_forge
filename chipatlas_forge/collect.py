@@ -89,6 +89,32 @@ def _has(tool: str) -> bool:
     return which(tool) is not None
 
 
+def assert_every_shard_was_routed(root: Path, org: str):
+    """Refuse to build BEDs from a partial stage 2.
+
+    If some route tasks died, their shards contributed nothing and every group
+    they touched comes out short -- with no error, no gap, and output that looks
+    entirely plausible. The only way to notice later is a peak count nobody
+    checked. So it is a hard stop here, and the fix is to rerun the missing
+    array indices, which is cheap because shards persist.
+    """
+    index = json.loads((root / "work" / "shards" / org / "shards.json").read_text())
+    expected = {name.split(".")[0] for name in index["shards"]}
+    stats_dir = root / "work" / "stats" / org
+    routed = {p.stem for p in stats_dir.glob("*.json")} if stats_dir.exists() else set()
+    missing = sorted(expected - routed)
+    if missing:
+        indices = [int(name.split("_")[1]) for name in missing]
+        raise SystemExit(
+            "%d of %d shards were never routed for %s, so any BED built now "
+            "would be silently incomplete.\nMissing: %s\nRerun stage 2 for those "
+            "indices, e.g.\n  ORG=%s sbatch --array=%s slurm/03_route.sh"
+            % (len(missing), len(expected), org, ",".join(missing[:10]) +
+               (" ..." if len(missing) > 10 else ""), org,
+               ",".join(str(i) for i in indices[:20]))
+        )
+
+
 def collect_bucket(root: Path, org: str, bucket: int, n_buckets: int,
                    compress: str) -> dict:
     started = time.time()
@@ -159,6 +185,9 @@ def main(argv=None) -> int:
     parser.add_argument("--buckets", type=int, default=128,
                         help="MUST match the --buckets stage 2 ran with")
     parser.add_argument("--compress", choices=["none", "gzip"], default="none")
+    parser.add_argument("--allow-partial", action="store_true",
+                        help="build BEDs even though some shards were never "
+                             "routed; the output WILL be incomplete")
     args = parser.parse_args(argv)
 
     if args.bucket == "all":
@@ -175,6 +204,9 @@ def main(argv=None) -> int:
     if not targets:
         print("nothing to do: bucket index is at or past --buckets %d" % args.buckets)
         return 0
+
+    if not args.allow_partial:
+        assert_every_shard_was_routed(args.root, args.org)
 
     for bucket in targets:
         collect_bucket(args.root, args.org, bucket, args.buckets, args.compress)
