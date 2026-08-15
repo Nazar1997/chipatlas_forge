@@ -1,0 +1,11 @@
+# Data in, data out, and everything in between. Only code is tracked here.
+raw/
+meta/
+work/
+out/
+logs/
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
