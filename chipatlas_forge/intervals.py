@@ -37,7 +37,6 @@ Usage:
 
 import argparse
 import json
-import pickle
 from pathlib import Path
 
 import numpy as np
@@ -46,6 +45,7 @@ import pyarrow.parquet as pq
 
 from . import arrow_compat as compat
 from . import layout
+from .genome import load_sequence
 
 # The grid the split is decided on. Equal to the largest window so that window
 # never straddles two labels, and a multiple of every smaller one so they nest.
@@ -317,8 +317,7 @@ def main(argv=None):
                          % (", ".join(bad), args.org))
 
     print("loading %s" % release.path("sequence"), flush=True)
-    with open(release.path("sequence"), "rb") as fh:
-        raw = pickle.load(fh)
+    raw = load_sequence(release.path("sequence"))
     sequences = {c: n_runs(raw[c]) for c in chrom_sizes if c in raw}
     missing = sorted(set(chrom_sizes) - set(sequences))
     if missing:

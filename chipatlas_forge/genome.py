@@ -75,11 +75,27 @@ def chrom_sizes_from_fasta(path):
     return sizes
 
 
+def load_sequence(path):
+    """The ``{chrom: sequence}`` mapping, however it happens to be serialised.
+
+    Not `pickle.load`. The pre-release file was written with
+    ``joblib.dump(..., compress=3)``, so it is a zlib stream with a joblib
+    header and raw unpickling fails with ``UnpicklingError: invalid load key,
+    'x'`` -- the 'x' being the first byte of the zlib magic. joblib reads plain
+    pickles too, so it is the right entry point either way; the fallback is only
+    for an environment without joblib.
+    """
+    try:
+        from joblib import load
+    except ImportError:
+        with open(path, "rb") as fh:
+            return pickle.load(fh)
+    return load(path)
+
+
 def chrom_sizes_from_sequence(path):
-    """``{chrom: length}`` from the ``{chrom: str}`` pickle, if that is all we have."""
-    with open(path, "rb") as fh:
-        seq = pickle.load(fh)
-    return {str(k): len(v) for k, v in seq.items()}
+    """``{chrom: length}`` from the ``{chrom: str}`` mapping, if that is all we have."""
+    return {str(k): len(v) for k, v in load_sequence(path).items()}
 
 
 def write_chrom_sizes(sizes, path):

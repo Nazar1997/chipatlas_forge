@@ -870,3 +870,29 @@ def test_pantissue_never_merges_its_own_output(toy):
     work = pantissue.plan(toy["release"])
     for _, sources in work:
         assert all(p.parent.name != PAN for p in sources)
+
+
+def test_sequence_is_read_through_joblib_not_raw_pickle(tmp_path):
+    """The pre-release sequence.pkl is joblib-compressed, not a plain pickle.
+
+    Raw `pickle.load` on it fails with `UnpicklingError: invalid load key, 'x'`
+    -- 'x' being the first byte of the zlib magic. It failed on the cluster only
+    after adopt and genome had both succeeded, because nothing before this stage
+    opens the file.
+    """
+    from joblib import dump
+
+    path = tmp_path / "sequence.pkl"
+    dump({"chr1": "ACGTNNNN", "chr2": "TTTT"}, path, compress=3)
+    with pytest.raises(Exception):
+        with open(path, "rb") as fh:
+            pickle.load(fh)
+    assert genome.load_sequence(path) == {"chr1": "ACGTNNNN", "chr2": "TTTT"}
+    assert genome.chrom_sizes_from_sequence(path) == {"chr1": 8, "chr2": 4}
+
+
+def test_a_plain_pickled_sequence_still_reads(tmp_path):
+    path = tmp_path / "sequence.pkl"
+    with open(path, "wb") as fh:
+        pickle.dump({"chr1": "ACGT"}, fh)
+    assert genome.load_sequence(path) == {"chr1": "ACGT"}

@@ -35,7 +35,6 @@ Usage:
 import argparse
 import json
 import os
-import pickle
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -47,7 +46,7 @@ import pyarrow.parquet as pq
 
 from . import arrow_compat as compat
 from . import layout
-from .genome import adopt
+from .genome import adopt, load_sequence
 
 BEDGRAPH_COLUMNS = ["chrom", "start", "end", "value"]
 
@@ -298,8 +297,7 @@ def build_dna(release, chroms, chunk_size, donor=None, dna_dir=None):
                 totals["linked"] += 1
         return totals
 
-    with open(release.path("sequence"), "rb") as fh:
-        sequence = pickle.load(fh)
+    sequence = load_sequence(release.path("sequence"))
     for chrom in sorted(chroms):
         seq = sequence[chrom]
         length = chroms[chrom]
