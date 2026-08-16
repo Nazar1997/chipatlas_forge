@@ -77,3 +77,49 @@ def to_numpy(array, dtype) -> np.ndarray:
         return np.empty(0, dtype=dtype)
     return np.frombuffer(array.buffers()[1], dtype=dtype, count=len(array),
                          offset=array.offset * dtype.itemsize)
+
+
+_NUMPY_FOR_ARROW = {str(v): k for k, v in _ARROW_FOR_NUMPY.items()}
+
+
+def table_to_frame(table):
+    """An Arrow table as a pandas DataFrame, built column by column.
+
+    ``Table.to_pandas`` is unusable here for the same reason as the rest of the
+    converter API, and fails in a way that hides what went wrong: a table whose
+    columns are all dictionary-encoded converts fine, and one plain int64 column
+    is enough to raise ``ValueError: Wrong number of dimensions. values.ndim >
+    ndim [2 > 1]`` from inside pandas' block manager. Reading the parquet, the
+    footer and the row groups all work -- only the final hand-off breaks -- so
+    the failure surfaces at the end of a long call chain and points at pandas
+    rather than at the ABI.
+
+    Dictionary columns are expanded to plain object arrays of strings rather
+    than left as pandas Categoricals. That is deliberate: the read path does
+    ``table.feature_name.map(ids_table).values``, and ``Series.map`` on a
+    Categorical returns another Categorical, so ``.values`` hands back a
+    Categorical where the caller expects an ndarray of ints. The old per-chunk
+    pickles came out of ``pyranges`` as object columns, so object is also what
+    every downstream operation was written against.
+    """
+    import pandas as pd
+
+    data = {}
+    for name, column in zip(table.column_names, table.columns):
+        if isinstance(column, pa.ChunkedArray):
+            column = column.combine_chunks()
+        if pa.types.is_dictionary(column.type):
+            values = np.asarray(column.dictionary.to_pylist(), dtype=object)
+            data[name] = values[to_numpy(column.indices, np.int32)]
+        elif pa.types.is_string(column.type) or pa.types.is_large_string(column.type):
+            data[name] = np.asarray(column.to_pylist(), dtype=object)
+        else:
+            dtype = _NUMPY_FOR_ARROW.get(str(column.type))
+            if dtype is None:
+                raise TypeError("no numpy dtype registered for Arrow %s (column %r)"
+                                % (column.type, name))
+            # to_numpy returns a read-only view onto Arrow memory; the frame
+            # outlives the table in every caller here, and pandas will happily
+            # hand out a mutable-looking Series over it, so copy.
+            data[name] = np.array(to_numpy(column, dtype), copy=True)
+    return pd.DataFrame(data, columns=list(table.column_names))

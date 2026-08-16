@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
+from . import arrow_compat as compat
 from . import layout
 
 # Column order `create_feature_matrix` expects, and what an empty result must
@@ -66,7 +67,7 @@ def load_chunk(release, tissue, chrom, start, end):
     row_group = index.get(int(start) // release.chunk_size)
     if row_group is None:
         return empty_omics()
-    return handle.read_row_group(row_group).to_pandas()
+    return compat.table_to_frame(handle.read_row_group(row_group))
 
 
 def load_window(release, tissue, chrom, begin, end):
@@ -110,7 +111,7 @@ def windows(release, window, split=None, tissue=None):
     """
     if release.interval_layout == layout.PER_SPLIT_PICKLE:
         return _legacy_windows(release, window, split, tissue)
-    frame = pq.read_table(release.windows(window)).to_pandas()
+    frame = compat.table_to_frame(pq.read_table(release.windows(window)))
     if split is not None:
         frame = frame[frame["split"] == split]
     if tissue is not None:
