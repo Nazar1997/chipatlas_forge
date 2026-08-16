@@ -1055,3 +1055,40 @@ def test_verify_catches_a_feature_no_file_resolves_to(toy):
         release.availability().write_text(saved)
         release.path("features").write_text(saved_features)
     assert rc == 1, "verify passed a release with an unreachable feature"
+
+
+# --------------------------------------------------------------------------
+# concurrent manifest updates
+
+
+def test_a_slow_stage_does_not_erase_what_a_fast_one_recorded(tmp_path):
+    """Two stages, each holding the snapshot it opened with.
+
+    This really happened: hg38's `chunks_dna` finished at 01:22 and was gone
+    from the manifest by 01:57, erased by `pairs`, which had opened the release
+    a minute earlier. The data was fine -- but `require()` reads the manifest to
+    decide a stage has run, and `verify`'s own entry is what gates promotion.
+    """
+    data = tmp_path / "data"
+    layout.Release.create(data, "toy", "2026-08")
+
+    slow = layout.Release.open(data, "toy", "2026-08")     # opens first
+    fast = layout.Release.open(data, "toy", "2026-08")     # opens second
+    fast.record("chunks_dna", chunks=47137)                # finishes first
+    slow.record("pairs", n_pairs=1106074)                  # finishes last
+
+    fresh = layout.Release.open(data, "toy", "2026-08")
+    assert set(fresh.manifest["stages"]) == {"chunks_dna", "pairs"}
+    assert fresh.manifest["stages"]["chunks_dna"]["chunks"] == 47137
+    assert fresh.has("chunks_dna") and fresh.has("pairs")
+
+
+def test_the_manifest_is_never_half_written(tmp_path):
+    """A reader mid-write would otherwise get a JSONDecodeError."""
+    data = tmp_path / "data"
+    release = layout.Release.create(data, "toy", "2026-08")
+    release.record("verify", checks=760779)
+    path = layout.release_root(data, "toy", "2026-08") / "MANIFEST.json"
+    assert json.loads(path.read_text())["stages"]["verify"]["checks"] == 760779
+    leftovers = list(path.parent.glob("MANIFEST.json.tmp*"))
+    assert not leftovers, "temporary manifest was left behind: %s" % leftovers

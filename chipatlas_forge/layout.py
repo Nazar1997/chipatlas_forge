@@ -291,8 +291,37 @@ class Release:
         return cls(root, manifest)
 
     def save(self):
-        (self.root / "MANIFEST.json").write_text(
-            json.dumps(self.manifest, indent=2, sort_keys=True) + "\n")
+        """Write the manifest, merging anything another stage recorded meanwhile.
+
+        Stages run concurrently and each holds the snapshot it read at `open()`,
+        so a plain write is a lost update: hg38's `chunks_dna` finished at 01:22
+        and was erased at 01:57 by `pairs`, which had opened the release a minute
+        before it. Nothing was wrong with the data -- but the manifest is how
+        `require()` decides a stage has run, and how `verify` records that a
+        release may be promoted, so losing an entry is losing exactly the thing
+        that gates the next step.
+
+        Re-reading and merging keeps `stages` additive. Top-level keys still take
+        this process's value, which is correct: each is written by exactly one
+        stage. The write goes through a temporary file and a rename, so a reader
+        never sees a half-written manifest.
+        """
+        path = self.root / "MANIFEST.json"
+        merged = {}
+        if path.exists():
+            try:
+                merged = json.loads(path.read_text())
+            except ValueError:
+                merged = {}
+        stages = dict(merged.get("stages") or {})
+        stages.update(self.manifest.get("stages") or {})
+        merged.update({k: v for k, v in self.manifest.items() if k != "stages"})
+        merged["stages"] = stages
+        self.manifest = merged
+
+        tmp = path.with_name(path.name + ".tmp.%d" % os.getpid())
+        tmp.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp, path)
 
     def record(self, stage, **stats):
         """Note that a stage finished, with whatever it counted."""
