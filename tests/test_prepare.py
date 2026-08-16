@@ -1005,3 +1005,32 @@ def test_verify_catches_a_tissue_with_features_but_no_rows(toy, tmp_path):
         for chrom, blob in saved.items():
             release.omics_chunk("Blood", chrom).write_bytes(blob)
     assert rc == 1, "verify passed a release with a silently empty tissue"
+
+
+def test_a_feature_whose_file_matches_neither_spelling_is_still_found(toy):
+    """`H3PERIOD3_K27M_mutant` -> alias `H3.3 K27M mutant` -> file
+    `H3.3_K27M_mutant.bedgraph`. All three differ; only their slugs agree."""
+    index = chunks.feature_index(["H3PERIOD3_K27M_mutant"],
+                                 {"H3PERIOD3_K27M_mutant": "H3.3 K27M mutant"})
+    from chipatlas_forge.keys import slugify
+    assert index[slugify("H3.3_K27M_mutant")] == "H3PERIOD3_K27M_mutant"
+    assert index[slugify("H3PERIOD3_K27M_mutant")] == "H3PERIOD3_K27M_mutant"
+
+
+def test_two_features_sharing_a_filename_slug_are_refused(toy):
+    """Whichever won would take the other's peaks into its column."""
+    with pytest.raises(SystemExit) as excinfo:
+        chunks.feature_index(["A B", "A_B"])
+    assert "wrong column" in str(excinfo.value)
+
+
+def test_signal_files_finds_the_awkward_alias_on_disk(toy):
+    release = toy["release"]
+    path = release.path("signal_root") / "Histone" / "Blood" / "H3.3_K27M_mutant.bedgraph"
+    path.write_text("chr1\t0\t10\t500\n")
+    try:
+        found = chunks.signal_files(release, "Blood", ["H3PERIOD3_K27M_mutant"],
+                                    {"H3PERIOD3_K27M_mutant": "H3.3 K27M mutant"})
+        assert set(found) == {"H3PERIOD3_K27M_mutant"}
+    finally:
+        path.unlink()

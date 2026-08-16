@@ -100,20 +100,49 @@ def signal_files(release, tissue, features, aliases=None):
     if not root.is_dir():
         raise SystemExit("%s does not exist -- run binmax into the release first"
                          % root)
-    from_file = {name: name for name in features}          # stem -> vocab name
-    for name, data_name in (aliases or {}).items():
-        from_file[data_name] = name
+    from_file = feature_index(features, aliases)
 
     found = {}
     for path in tissue_dirs(root, tissue):
         for bedgraph in sorted(path.glob("*.bedgraph")):
-            name = from_file.get(bedgraph.stem)
+            name = from_file.get(slugify(bedgraph.stem))
             if name is not None:
                 # An antigen can appear under two classes; either file is the
                 # same measurement, so first wins and the duplicate is skipped
                 # rather than concatenated into a doubled track.
                 found.setdefault(name, bedgraph)
     return found
+
+
+def feature_index(features, aliases=None):
+    """``{slug of a filename stem: vocabulary name}``.
+
+    Slug-keyed for the same reason directories are. Filenames were slugified on
+    the way out, and neither spelling of an antigen necessarily survives it: the
+    vocabulary name `H3PERIOD3_K27M_mutant` and its alias target
+    `H3.3 K27M mutant` are both different from the file's actual stem,
+    `H3.3_K27M_mutant`. Comparing slugs is the only form in which all three
+    agree.
+
+    Both the vocabulary name and its alias are indexed, because either may be
+    the one that slugs to the filename.
+    """
+    index = {}
+    collisions = {}
+    for name in features:
+        for spelling in {name, (aliases or {}).get(name, name)}:
+            key = slugify(spelling)
+            if index.setdefault(key, name) != name:
+                collisions.setdefault(key, {index[key], name})
+    if collisions:
+        # Two vocabulary columns cannot share a file: whichever won would take
+        # the other's peaks.
+        raise SystemExit(
+            "%d filename slug(s) map to more than one vocabulary feature, so a "
+            "track would be filed under the wrong column: %s"
+            % (len(collisions), sorted((k, sorted(v)) for k, v in
+                                       collisions.items())[:5]))
+    return index
 
 
 def tissue_dirs(root, tissue):
