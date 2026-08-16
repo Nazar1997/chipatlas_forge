@@ -268,28 +268,37 @@ def main(argv=None):
           % (len(groups), len(tissues), len(antigens), rounds,
              "" if rounds == 1 else "s"), flush=True)
 
-    frozen_from, vanished, appeared = None, [], []
+    frozen_from, vanished, appeared, aliases = None, [], [], {}
     if args.freeze_features:
         frozen = read_feature_list(args.freeze_features)
         frozen_from = str(args.freeze_features)
-        antigens, availability, vanished, appeared = apply_freeze(
-            frozen, antigens, availability)
+        pairs = raw_pairs(groups)
+        aliases, ambiguous = resolve_aliases(frozen, {a for _, a in pairs})
+        if ambiguous:
+            raise SystemExit(
+                "%d frozen feature(s) match more than one antigen in the data, "
+                "so the mapping would be a guess: %s"
+                % (len(ambiguous), sorted(ambiguous.items())[:5]))
+        antigens, availability, tissues, thin, vanished, appeared = apply_freeze(
+            frozen, pairs, aliases, args.min_antigens)
+
         print("frozen to %d features from %s" % (len(antigens), frozen_from))
-        print("  %d frozen features absent from this data (kept as never-available"
+        if aliases:
+            shown = sorted(aliases.items())[:4]
+            print("  %d frozen name(s) matched by undoing the old dot mangling: %s"
+                  % (len(aliases), ", ".join("%s -> %s" % kv for kv in shown)))
+        print("  %d frozen features have no data anywhere (kept as never-available"
               " columns)%s" % (len(vanished),
                                ": " + ", ".join(vanished[:8]) if vanished else ""))
         print("  %d new features left out to preserve the column order%s"
               % (len(appeared),
                  ": " + ", ".join(appeared[:8]) if appeared else ""))
-        # A tissue can fall below threshold once the new-only antigens are
-        # removed; it would otherwise be listed with almost nothing available.
-        thin = [t for t in tissues if len(availability[t]) < args.min_antigens]
         if thin:
-            print("  dropping %d tissue(s) that fall below %d features under the "
-                  "frozen vocabulary: %s"
-                  % (len(thin), args.min_antigens, ", ".join(thin)))
-            tissues = [t for t in tissues if t not in thin]
-            availability = {t: availability[t] for t in tissues}
+            print("  %d tissue(s) below %d features under the frozen vocabulary, "
+                  "dropped: %s" % (len(thin), args.min_antigens, ", ".join(thin)))
+        print("  %d tissues, mean %d features each"
+              % (len(tissues),
+                 sum(len(v) for v in availability.values()) // max(len(tissues), 1)))
 
     index_dir = release.path("tissues").parent
     index_dir.mkdir(parents=True, exist_ok=True)
@@ -304,6 +313,10 @@ def main(argv=None):
     release.path("features").write_text(json.dumps({
         "features": antigens,
         "frozen_from": frozen_from,
+        # `aliases` maps a vocabulary name to the name the signal files use.
+        # Downstream stages must look files up through it, or the mangled
+        # columns would find nothing and stay empty.
+        "aliases": aliases,
         "absent_from_data": vanished,
         "excluded_by_freeze": appeared,
     }, indent=2) + "\n")
@@ -315,7 +328,8 @@ def main(argv=None):
     release.record("vocab",
                    n_tissues=len(tissues), n_features=len(antigens),
                    min_antigens=args.min_antigens, min_tissues=args.min_tissues,
-                   frozen_from=frozen_from)
+                   frozen_from=frozen_from, n_aliases=len(aliases),
+                   n_absent=len(vanished))
     print("wrote %s, %s and %s"
           % (release.path("tissues").name, release.path("features").name,
              release.availability().name), flush=True)
