@@ -119,6 +119,19 @@ def toy(tmp_path_factory):
 
 
 def test_overlap_bp_matches_a_dense_mask():
+    """Subsumes the training repo's `get_omics_vector` tests, which are now gone.
+
+    Those seven cases guarded a real bug: the old code narrowed candidate rows
+    with ``ind_left = searchsorted(...) - 1``, which is ``-1`` when no interval
+    starts at or before ``begin``, and ``.iloc[-1:k]`` counts from the END of
+    the frame and returns an empty slice. Every chromosome's first region starts
+    at ``begin=0``, so blacklist coverage there came back all-zero and
+    blacklisted windows were never excluded.
+
+    `overlap_bp` cannot reproduce it -- there is no row pre-selection to get
+    wrong -- and this checks the property those cases sampled by hand against a
+    dense mask over 300 random inputs, including windows starting at 0.
+    """
     rng = np.random.default_rng(0)
     for _ in range(300):
         n = int(rng.integers(0, 12))
