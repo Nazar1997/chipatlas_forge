@@ -164,6 +164,19 @@ def raw_pairs(groups, excluded_antigens=EXCLUDED_ANTIGENS,
     return set(zip(usable["ct_class"], usable["antigen"]))
 
 
+def add_pan_tissue(pairs, pan_tissue):
+    """Give the derived pan-tissue track every antigen that exists anywhere.
+
+    `pantissue` builds it by max-merging each antigen across all cell types, so
+    it genuinely carries every antigen with data -- which groups.tsv cannot say,
+    because ChIP-Atlas has no "all cell types" class to group by.
+    """
+    if not pan_tissue:
+        return pairs
+    antigens = {a for _, a in pairs}
+    return set(pairs) | {(pan_tissue, a) for a in antigens}
+
+
 def canonical(name):
     """A form in which the 2021 vocabulary's mangled names match the real ones.
 
@@ -256,6 +269,9 @@ def main(argv=None):
                         default=MIN_ANTIGENS_PER_TISSUE)
     parser.add_argument("--min-tissues", type=int,
                         default=MIN_TISSUES_PER_ANTIGEN)
+    parser.add_argument("--pan-tissue", default="All cell types",
+                        help="name of the derived all-cell-types track that "
+                             "`pantissue` builds; pass empty to leave it out")
     args = parser.parse_args(argv)
 
     release = layout.Release.open(args.data_dir, args.org, args.release)
@@ -264,6 +280,9 @@ def main(argv=None):
 
     tissues, antigens, availability, rounds = select(
         groups, args.min_antigens, args.min_tissues)
+    if args.pan_tissue and not args.freeze_features:
+        availability[args.pan_tissue] = list(antigens)
+        tissues = sorted(set(tissues) | {args.pan_tissue})
     print("from %d groups: %d tissues, %d antigens (converged in %d round%s)"
           % (len(groups), len(tissues), len(antigens), rounds,
              "" if rounds == 1 else "s"), flush=True)
@@ -272,7 +291,7 @@ def main(argv=None):
     if args.freeze_features:
         frozen = read_feature_list(args.freeze_features)
         frozen_from = str(args.freeze_features)
-        pairs = raw_pairs(groups)
+        pairs = add_pan_tissue(raw_pairs(groups), args.pan_tissue)
         aliases, ambiguous = resolve_aliases(frozen, {a for _, a in pairs})
         if ambiguous:
             raise SystemExit(

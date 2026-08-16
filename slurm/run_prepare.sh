@@ -33,7 +33,10 @@ fi
 # Every pending array task counts against MaxSubmitJobsPU, and a rejected
 # submission does not stop sbatch -- stage 09's array vanished silently that way
 # once already. Check before submitting rather than after.
-planned=$(( 7 + N_TISSUES ))
+# One task per antigen would be thousands; a strided array over a size-sorted
+# list balances them without needing that many.
+PAN_TASKS="${PAN_TASKS:-40}"
+planned=$(( 7 + N_TISSUES + PAN_TASKS ))
 limit=$(sacctmgr -n show qos normal format=MaxSubmitJobsPU | tr -d ' ')
 in_queue=$(squeue -u "$USER" -h -r | wc -l)
 if [[ -n "$limit" ]] && (( in_queue + planned > limit )); then
@@ -44,10 +47,14 @@ fi
 echo "org=$ORG release=$RELEASE donor=$DONOR_RELEASE tissues=$N_TISSUES"
 submit() { sbatch --parsable "$@"; }
 
+# genome comes early now: pantissue needs chrom_sizes, and vocab needs the
+# pan-tissue track to exist before it can list it as a tissue.
 adopt=$(ORG=$ORG   submit slurm/05b_adopt.sh)
-vocab=$(ORG=$ORG   submit --dependency=afterok:$adopt  slurm/06_vocab.sh)
-genome=$(ORG=$ORG  submit --dependency=afterok:$vocab  slurm/07_genome.sh)
-ivals=$(ORG=$ORG   submit --dependency=afterok:$genome slurm/08_intervals.sh)
+genome=$(ORG=$ORG  submit --dependency=afterok:$adopt  slurm/07_genome.sh)
+pan=$(ORG=$ORG TASKS=$PAN_TASKS submit --dependency=afterok:$genome \
+      --array=0-$((PAN_TASKS - 1)) slurm/05c_pantissue.sh)
+vocab=$(ORG=$ORG   submit --dependency=afterok:$pan    slurm/06_vocab.sh)
+ivals=$(ORG=$ORG   submit --dependency=afterok:$vocab  slurm/08_intervals.sh)
 dna=$(ORG=$ORG     submit --dependency=afterok:$ivals  slurm/09_chunks_dna.sh)
 omics=$(ORG=$ORG TASKS=$N_TISSUES submit --dependency=afterok:$ivals \
         --array=0-$((N_TISSUES - 1)) slurm/09_chunks.sh)
@@ -55,8 +62,9 @@ pairs=$(ORG=$ORG   submit --dependency=afterok:$omics  slurm/10_pairs.sh)
 verify=$(ORG=$ORG  submit --dependency=afterok:$dna:$omics:$pairs slurm/11_verify.sh)
 
 echo "  05b adopt     $adopt"
-echo "  06  vocab     $vocab"
 echo "  07  genome    $genome"
+echo "  05c pantissue $pan  (array 0-$((PAN_TASKS - 1)))"
+echo "  06  vocab     $vocab"
 echo "  08  intervals $ivals"
 echo "  09  dna       $dna"
 echo "  09  omics     $omics  (array 0-$((N_TISSUES - 1)))"

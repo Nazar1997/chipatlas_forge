@@ -22,10 +22,14 @@ pytest.importorskip("pyarrow")
 import pyarrow.parquet as pq                                       # noqa: E402
 
 from chipatlas_forge import (chunks, genome, intervals, layout,    # noqa: E402
-                             migrate, read, verify, vocab)
+                             migrate, pantissue, read, verify, vocab)
 
 CHROM_SIZES = {"chr1": 400_000, "chr8": 300_000, "chr9": 120_000}
 TISSUES = ["Blood", "Liver", "Neural"]
+# The derived all-cell-types track, built by `pantissue` and not present in
+# groups.tsv -- ChIP-Atlas has no such cell-type class to group by.
+PAN = "All cell types"
+ALL_TISSUES = sorted(TISSUES + [PAN])
 ANTIGENS = ["AG%03d" % i for i in range(60)]
 N_GAP = (50_000, 70_000)
 BLACKLIST = [("chr1", 120_000, 130_000), ("chr8", 10_000, 11_000)]
@@ -33,7 +37,8 @@ BLACKLIST = [("chr1", 120_000, 130_000), ("chr8", 10_000, 11_000)]
 FILE_LIST = "".join(
     "%s.%s.05.AllAg.AllCell\ttoy\t%s\t-\t%s\t-\t05\tSRX1\n" % (ag, ct, agn, ctn)
     for ag, agn in (("His", "Histone"), ("Oth", "TFs and others"))
-    for ct, ctn in (("Bld", "Blood"), ("Liv", "Liver"), ("Neu", "Neural")))
+    for ct, ctn in (("Bld", "Blood"), ("Liv", "Liver"), ("Neu", "Neural"),
+                    ("ALL", PAN)))
 
 
 def antigen_class(antigen):
@@ -84,13 +89,9 @@ def toy(tmp_path_factory):
     release.path("groups").write_text("\n".join(rows) + "\n")
 
     args = ["--data-dir", str(data), "--org", "toy", "--release", "2026-08"]
-    assert vocab.main(args + ["--meta-dir", str(meta)]) == 0
     assert genome.main(args + ["--fasta", str(src / "genome.fa"),
                                "--blacklist", str(src / "blacklist.bed"),
                                "--sequence", str(src / "sequence.pkl")]) == 0
-    assert intervals.main(args + ["--windows", "8192", "65536",
-                                  "--val-chroms", "chr8", "chr9"]) == 0
-    assert chunks.main(args + ["--what", "dna"]) == 0
 
     release = layout.Release.open(data, "toy", "2026-08")
     for tissue in TISSUES:
@@ -108,6 +109,13 @@ def toy(tmp_path_factory):
                           for s in starts.tolist()]
             path.write_text("\n".join(lines) + "\n")
 
+    # Derived from the per-tissue tracks, so it has to come after them and
+    # before vocab -- which lists it as a tissue.
+    assert pantissue.main(args + ["--task", "all"]) == 0
+    assert vocab.main(args + ["--meta-dir", str(meta)]) == 0
+    assert intervals.main(args + ["--windows", "8192", "65536",
+                                  "--val-chroms", "chr8", "chr9"]) == 0
+    assert chunks.main(args + ["--what", "dna"]) == 0
     assert chunks.main(args + ["--what", "omics", "--task", "all"]) == 0
     layout.promote(data, "toy", "2026-08")
     return {"data": data, "meta": meta, "src": src, "sequence": sequence,
@@ -186,7 +194,7 @@ def test_vocab_applies_both_thresholds_to_a_fixed_point(toy):
     features = json.loads(toy["release"].path("features").read_text())["features"]
     tissues = json.loads(toy["release"].path("tissues").read_text())["tissues"]
     assert features == ANTIGENS
-    assert [t["name"] for t in tissues] == TISSUES
+    assert [t["name"] for t in tissues] == ALL_TISSUES
     # "Sparse" had 10 antigens, below the 50 threshold; LONELY had one tissue,
     # below 3; Epitope_tags and Input control are excluded outright.
     assert "Sparse" not in [t["name"] for t in tissues]
@@ -196,7 +204,23 @@ def test_vocab_applies_both_thresholds_to_a_fixed_point(toy):
 
 def test_vocab_derives_class_codes_from_filelist(toy):
     tissues = json.loads(toy["release"].path("tissues").read_text())["tissues"]
-    assert [t["code"] for t in tissues] == ["Bld", "Liv", "Neu"]
+    codes = {t["name"]: t["code"] for t in tissues}
+    assert codes == {"Blood": "Bld", "Liver": "Liv", "Neural": "Neu",
+                     PAN: "ALL"}
+
+
+def test_the_pan_tissue_carries_every_antigen(toy):
+    """It is a genuine superset, unlike the 2021 one it replaces.
+
+    That one had ~1004 antigens but none of H3K27ac / H3K4me1 / H3K4me3 /
+    H3K27me3 / RNA polymerase II, because ChIP-Atlas publishes those only
+    per-tissue -- so pairing on it saw none of the marks that define enhancers
+    and promoters.
+    """
+    have = json.loads(toy["release"].availability().read_text())
+    assert set(have[PAN]) == set(ANTIGENS)
+    for tissue in TISSUES:
+        assert set(have[tissue]) <= set(have[PAN])
 
 
 def test_freezing_keeps_column_order_and_reports_the_drift():
@@ -345,9 +369,9 @@ def test_the_split_nests_across_window_sizes(toy):
 def test_windows_are_materialised_per_strand_and_tissue(toy):
     frame = read.windows(toy["release"], 8192)
     assert set(frame.strand) == {"+", "-"}
-    assert set(frame.tissue) == set(TISSUES)
+    assert set(frame.tissue) == set(ALL_TISSUES)
     loci = frame[["chrom", "start"]].drop_duplicates()
-    assert len(frame) == len(loci) * 2 * len(TISSUES)
+    assert len(frame) == len(loci) * 2 * len(ALL_TISSUES)
 
 
 def test_no_locus_appears_in_two_splits(toy):
@@ -776,3 +800,73 @@ def test_an_empty_class_in_groups_tsv_is_rejected(tmp_path):
     with pytest.raises(SystemExit) as excinfo:
         vocab.read_groups(release)
     assert "antigen" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------
+# pantissue
+
+
+def _runs(path):
+    """A bedGraph as {(chrom, position): max value covering it}.
+
+    The maximum, not the last writer: the fixture's per-tissue tracks contain
+    overlapping intervals on purpose, so that the merge is exercised against
+    input it would have to collapse rather than input that is already flat.
+    """
+    out = {}
+    for line in path.read_text().splitlines():
+        chrom, start, end, value = line.split("\t")
+        value = int(value)
+        for pos in range(int(start), int(end)):
+            key = (chrom, pos)
+            if value > out.get(key, 0):
+                out[key] = value
+    return out
+
+
+def test_the_pan_tissue_track_is_the_max_over_every_tissue(toy):
+    """Exact, per base, against a brute-force maximum.
+
+    Each per-tissue track is already the max over that tissue's peaks, so the
+    max across tissues is the max over every peak of the antigen anywhere --
+    the same answer binmax would give on the union, without revisiting it.
+    """
+    release = toy["release"]
+    antigen = ANTIGENS[0]
+    ag_class = antigen_class(antigen).replace(" ", "_")
+
+    expected = {}
+    for tissue in TISSUES:
+        for key, value in _runs(release.path("signal_root") / ag_class / tissue
+                                / ("%s.bedgraph" % antigen)).items():
+            expected[key] = max(expected.get(key, 0), value)
+
+    got = _runs(release.path("signal_root") / ag_class / PAN
+                / ("%s.bedgraph" % antigen))
+    assert got == expected, "pan-tissue track is not the per-base maximum"
+
+
+def test_the_pan_tissue_track_is_sorted_and_run_length_encoded(toy):
+    """Later stages assume genomic order, and adjacent equal runs waste space."""
+    release = toy["release"]
+    antigen = ANTIGENS[0]
+    path = (release.path("signal_root") / antigen_class(antigen).replace(" ", "_")
+            / PAN / ("%s.bedgraph" % antigen))
+    rows = [line.split("\t") for line in path.read_text().splitlines()]
+    seen, previous = [], None
+    for chrom, start, end, value in rows:
+        if chrom != (previous or (None,))[0]:
+            assert chrom not in seen, "chromosome %s is not contiguous" % chrom
+            seen.append(chrom)
+        else:
+            assert int(start) >= int(previous[2]), "runs overlap or are unsorted"
+            if int(start) == int(previous[2]):
+                assert value != previous[3], "adjacent equal runs were not merged"
+        previous = (chrom, start, end, value)
+
+
+def test_pantissue_never_merges_its_own_output(toy):
+    """Re-running must be idempotent, not compound the pan track into itself."""
+    work = pantissue.plan(toy["release"])
+    for _, sources in work:
+        assert all(p.parent.name != PAN for p in sources)
