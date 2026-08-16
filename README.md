@@ -43,8 +43,9 @@ everything else combined.
 | `collect` | **1 task/bucket** | concatenate parts → final BEDs |
 | `binmax` | **1 task/file slice** | overlapping peaks → max-score signal track |
 | `adopt` | 1 task | link signal + groups.tsv into a new release |
-| `vocab` | 1 task | which tissues and antigens the release trains on |
 | `genome` | 1 task | reference, blacklist, chromosome lengths |
+| `pantissue` | **1 task/antigen slice** | all-cell-types track: max over every tissue |
+| `vocab` | 1 task | which tissues and antigens the release trains on |
 | `intervals` | 1 task | chunk grid, window tables, train/val/test split |
 | `chunks` | **1 task/tissue** | per-chunk DNA text, per-(tissue, chrom) omics parquet |
 | `pairs` | 1 task | IDF track weights + omics-similarity pair index |
@@ -346,3 +347,54 @@ them — the same incompatibility by another name.
 
 Refreshing the vocabulary is a deliberate act with a retraining budget attached,
 not something a data rebuild does on its own.
+
+
+## The all-cell-types track
+
+ChIP-Atlas's cell-type classes are real tissues, so nothing grouped from
+per-experiment metadata can produce an "all cell types" bucket. The 2021 tree
+had one only because it took ChIP-Atlas's precomputed `*.AllCell.bed`
+aggregates rather than deriving anything — and losing it is not cosmetic: it is
+the tissue `only_one_tissue` runs train on, the default the embedding
+datamodule falls back to, and what the pair builder profiles against.
+
+`pantissue` derives it by max-merging each antigen across every cell type.
+That is exact rather than approximate: each per-tissue track is already the
+maximum over that tissue's peaks, so the maximum *across* tissues is the maximum
+over every peak of that antigen anywhere — the same answer `binmax` would give
+on the union of the raw peaks, without going back to them.
+
+It is also strictly better than what it replaces. The 2021 pan-tissue track was
+**not** a superset: on hg38 it carried ~1004 antigens but none of H3K27ac /
+H3K4me1 / H3K4me3 / H3K27me3 / RNA polymerase II, because ChIP-Atlas publishes
+those only per-tissue — so pairing on it had no view of the marks that define
+enhancers and promoters.
+
+## Freezing, and the names the 2021 vocabulary got wrong
+
+`--freeze-features` pins the feature list, because the omics head's output
+dimension is the feature count rounded up to a power of two and changing it
+makes every existing checkpoint architecturally unloadable.
+
+Two things that freezing must *not* do, both found by running against the real
+data:
+
+**The thresholds are not re-applied.** `min_tissues` exists to *choose* a
+vocabulary; once frozen the choice is made. Re-running it over the new snapshot
+marked 395 of hg38's 1,009 frozen features absent — 392 of them with data in
+exactly two tissues — which would have zeroed 39% of the target matrix because
+tissue counts shifted between snapshots.
+
+**The old dot mangling is undone.** The 2021 preparation parsed
+`05.<antigen>.AllCell.bed` by splitting on `.`, so a dotted antigen could not
+survive a round trip; something upstream substituted the literal string
+`PERIOD` for the dot and underscores for spaces. The frozen vocabulary holds
+`H2APERIODX`, `H3PERIOD3_K27M_mutant` and `RNA_polymerase_II` where ChIP-Atlas
+says `H2A.X`, `H3.3 K27M mutant` and `RNA polymerase II`. Sixteen of hg38's
+seventeen and ten of mm10's eleven apparently-absent features are exactly this,
+recovered by canonical matching and recorded in `features.json` as `aliases`.
+Only unambiguous matches are taken — guessing wrong files one track's peaks
+under another track's column.
+
+After both fixes, hg38 has **1 genuinely absent feature out of 1,009** (`AllAg`,
+an aggregate that was never an antigen) and mm10 has 2.
