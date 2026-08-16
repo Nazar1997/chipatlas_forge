@@ -18,7 +18,14 @@ set -euo pipefail
 source "${FORGE_ENV:-$(cd "$(dirname "$0")" && pwd)/_env.sh}"
 cd "$ROOT"
 ORG="${ORG:?set ORG=hg38 or ORG=mm10}"
-FREEZE_FEATURES="${FREEZE_FEATURES:-$DATA_DIR/$ORG/releases/$DONOR_RELEASE/index/features.json}"
+if [[ -z "${FREEZE_FEATURES:-}" ]]; then
+    if have_donor_release "$ORG"; then
+        FREEZE_FEATURES="$DATA_DIR/$ORG/releases/$DONOR_RELEASE/index/features.json"
+    else
+        # The pre-release vocabulary, as a joblib pickle. Same 1,009 columns.
+        FREEZE_FEATURES="$DATA_DIR/$ORG/SupportFiles/target_features.pkl"
+    fi
+fi
 echo "host=$(hostname) org=$ORG release=$RELEASE started=$(date)"
 freeze=()
 [[ -n "$FREEZE_FEATURES" && -f "$FREEZE_FEATURES" ]] && freeze=(--freeze-features "$FREEZE_FEATURES")

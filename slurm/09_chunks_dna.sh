@@ -18,7 +18,13 @@ cd "$ROOT"
 ORG="${ORG:?set ORG=hg38 or ORG=mm10}"
 echo "host=$(hostname) org=$ORG release=$RELEASE donor=${DONOR_RELEASE:-none} started=$(date)"
 donor=()
-[[ -n "${DONOR_RELEASE:-}" ]] && donor=(--from-release "$DONOR_RELEASE")
+if have_donor_release "$ORG"; then
+    donor=(--from-release "$DONOR_RELEASE")
+elif [[ -d "$DATA_DIR/$ORG/Subtables/dna" ]]; then
+    # Links from the tree the running jobs are reading. Read-only on the source,
+    # and a hard link, so this neither disturbs them nor duplicates 3 GB.
+    donor=(--dna-dir "$DATA_DIR/$ORG/Subtables/dna")
+fi
 $PY -m chipatlas_forge.chunks \
     --data-dir "$DATA_DIR" --org "$ORG" --release "$RELEASE" \
     --what dna "${donor[@]}"

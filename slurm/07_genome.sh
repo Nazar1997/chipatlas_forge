@@ -15,7 +15,14 @@ source "${FORGE_ENV:-$(cd "$(dirname "$0")" && pwd)/_env.sh}"
 cd "$ROOT"
 ORG="${ORG:?set ORG=hg38 or ORG=mm10}"
 echo "host=$(hostname) org=$ORG release=$RELEASE donor=$DONOR_RELEASE started=$(date)"
+if have_donor_release "$ORG"; then
+    source_args=(--from-release "$DONOR_RELEASE")
+else
+    source_args=(--fasta     "$DATA_DIR/$ORG/DNA/$ORG.fa"
+                 --blacklist "$DATA_DIR/$ORG/DNA/$ORG-blacklist.v2.bed"
+                 --sequence  "$DATA_DIR/$ORG/SupportFiles/${ORG}_DNA_seq.pkl")
+fi
 $PY -m chipatlas_forge.genome \
     --data-dir "$DATA_DIR" --org "$ORG" --release "$RELEASE" \
-    --from-release "$DONOR_RELEASE"
+    "${source_args[@]}"
 echo "finished=$(date)"

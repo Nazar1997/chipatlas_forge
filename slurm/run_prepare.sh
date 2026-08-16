@@ -21,8 +21,11 @@ ORG="${ORG:?set ORG=hg38 or ORG=mm10}"
 # own tissues.json does not exist until stage 06 runs -- and the count only
 # changes when the vocabulary is refreshed, which is not what this pipeline does.
 TISSUE_JSON="$DATA_DIR/$ORG/releases/${DONOR_RELEASE}/index/tissues.json"
+TISSUE_PKL="$DATA_DIR/$ORG/SupportFiles/target_tissues.pkl"
 if [[ -f "$TISSUE_JSON" ]]; then
     N_TISSUES=$($PY -c "import json,sys;print(len(json.load(open(sys.argv[1]))['tissues']))" "$TISSUE_JSON")
+elif [[ -f "$TISSUE_PKL" ]]; then
+    N_TISSUES=$($PY -c "from joblib import load;import sys;print(len(load(sys.argv[1])))" "$TISSUE_PKL")
 else
     N_TISSUES="${N_TISSUES:-24}"
 fi

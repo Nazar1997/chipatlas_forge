@@ -34,3 +34,14 @@ RELEASE="${RELEASE:-$(date -u +%Y-%m)}"
 # whichever ChIP-Atlas snapshot the peaks came from, so this is a hard link
 # rather than 3 GB of copying. Unset it to rebuild from the FASTA.
 DONOR_RELEASE="${DONOR_RELEASE:-2021-10}"
+
+# Whether $DONOR_RELEASE actually exists for $ORG. Until the 2021 tree is
+# migrated there is no donor *release* -- only the pre-release
+# data/<org>/{DNA,SupportFiles,Subtables} layout -- and the stages that adopt
+# the genome and the DNA chunks have to read that instead. Migration is blocked
+# on training being idle, and building a release should not have to wait for it.
+have_donor_release() {
+    local org="$1"
+    [[ -n "${DONOR_RELEASE:-}" \
+       && -f "$DATA_DIR/$org/releases/$DONOR_RELEASE/MANIFEST.json" ]]
+}
