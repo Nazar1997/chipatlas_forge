@@ -21,3 +21,16 @@ mkdir -p "$ROOT/logs"
 # Never pass --mem on this cluster: cpu-e-quick nodes report RealMemory=1
 # because memory is not a scheduled resource, so any --mem request is rejected
 # outright even though the node has ~790 GB free.
+
+# --- prepare stages (06-11) -------------------------------------------------
+# Where releases live. The peak stages write into $ROOT (forge's own working
+# tree); the prepare stages write into the data directory beside it, because a
+# release is training input and not a build artifact of this repository.
+DATA_DIR="${DATA_DIR:-$(cd "$ROOT/.." && pwd)}"
+# The release being built. Dated, and it becomes a directory name -- see
+# chipatlas_forge.layout.check_release_id for what is allowed.
+RELEASE="${RELEASE:-$(date -u +%Y-%m)}"
+# The release whose genome and DNA chunks a new one adopts. hg38 is hg38
+# whichever ChIP-Atlas snapshot the peaks came from, so this is a hard link
+# rather than 3 GB of copying. Unset it to rebuild from the FASTA.
+DONOR_RELEASE="${DONOR_RELEASE:-2021-10}"

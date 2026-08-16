@@ -83,6 +83,14 @@ class TestNobodyUsesTheBrokenAPI:
          "pa.array(ndarray) is ABI-broken here; use arrow_compat.to_arrow"),
     ]
 
+    # A line-level regex cannot tell `pa.array(python_list)` from
+    # `pa.array(ndarray)`, nor a pandas Series' `.to_numpy` from an Arrow
+    # Array's. Both are genuinely safe and both appear in this package, so
+    # rather than loosen the patterns -- which would blind the guard to the real
+    # mistake -- a call site can be exempted explicitly, with its reason on the
+    # line. Grep-able, and a reviewer sees the claim next to the code.
+    EXEMPTION = re.compile(r"#\s*abi-ok:\s*(\S.*)")
+
     def test_package_sources_avoid_them(self):
         offences = []
         for path in sorted(PACKAGE.glob("*.py")):
@@ -94,12 +102,29 @@ class TestNobodyUsesTheBrokenAPI:
                 # only modules that actually hold Arrow objects can trip this.
                 continue
             for number, line in enumerate(source.splitlines(), 1):
+                if self.EXEMPTION.search(line):
+                    continue
                 code = line.split("#", 1)[0]
                 for pattern, why in self.FORBIDDEN:
                     if pattern.search(code):
                         offences.append("%s:%d  %s\n    %s"
                                         % (path.name, number, why, line.strip()))
         assert not offences, "\n".join(offences)
+
+    def test_an_exemption_must_state_a_reason(self):
+        """`# abi-ok` on its own would be a silent opt-out of the whole guard."""
+        assert not self.EXEMPTION.search("x = pa.array(v)  # abi-ok")
+        assert not self.EXEMPTION.search("x = pa.array(v)  # abi-ok:")
+        assert self.EXEMPTION.search("x = pa.array(v)  # abi-ok: v is a list of str")
+
+    def test_every_exemption_in_the_package_is_justified(self):
+        """Exemptions are load-bearing, so they are inventoried rather than trusted."""
+        for path in sorted(PACKAGE.glob("*.py")):
+            for number, line in enumerate(path.read_text().splitlines(), 1):
+                if "abi-ok" in line:
+                    assert self.EXEMPTION.search(line), (
+                        "%s:%d claims an exemption without a reason: %s"
+                        % (path.name, number, line.strip()))
 
     def test_the_guard_would_actually_catch_a_regression(self, tmp_path):
         """A guard that cannot fail is worse than no guard."""

@@ -1,12 +1,18 @@
 # chipatlas_forge
 
-Splits the ChIP-Atlas `allPeaks_light` archives into one BED per
-**(organism, antigen class, antigen, tissue)**.
+ChIP-Atlas peaks in, training-ready **releases** out.
+
+Two halves. The **peak pipeline** splits the `allPeaks_light` archives into one
+BED per (organism, antigen class, antigen, tissue) and collapses each into a
+max-score signal track. The **prepare pipeline** turns those tracks into a
+dated, immutable, self-describing release that the training repo reads directly.
 
 ```
-out/hg38/Histone/Blood/H3K27ac.bed
-out/hg38/TFs_and_others/Liver/CTCF.bed
-out/mm10/Histone/Neural/H3K4me3.bed
+out/hg38/Histone/Blood/H3K27ac.bed              # peak pipeline
+out_binmax1/hg38/Histone/Blood/H3K27ac.bedgraph #   ... collapsed to signal
+
+data/hg38/releases/2026-08/                     # prepare pipeline
+data/hg38/latest -> releases/2026-08            #   ... what training resolves
 ```
 
 Input is ~1.5 billion peaks for hg38 and ~1.1 billion for mm10. The design is
@@ -36,6 +42,13 @@ everything else combined.
 | `route` | **1 task/shard** | parse, resolve accessions, partition by bucket |
 | `collect` | **1 task/bucket** | concatenate parts → final BEDs |
 | `binmax` | **1 task/file slice** | overlapping peaks → max-score signal track |
+| `adopt` | 1 task | link signal + groups.tsv into a new release |
+| `vocab` | 1 task | which tissues and antigens the release trains on |
+| `genome` | 1 task | reference, blacklist, chromosome lengths |
+| `intervals` | 1 task | chunk grid, window tables, train/val/test split |
+| `chunks` | **1 task/tissue** | per-chunk DNA text, per-(tissue, chrom) omics parquet |
+| `pairs` | 1 task | IDF track weights + omics-similarity pair index |
+| `verify` | 1 task | prove the release is complete before promoting it |
 
 Only `shard` is serial, and only for the reason above. It is a one-time cost:
 shards persist, so changing the grouping and rerunning `route` + `collect` never
@@ -208,3 +221,128 @@ array looks like.
   itself is fine. Run `tests/` off-cluster.
 * The meta CSV is **cp1252, not utf-8** — it carries smart quotes that make
   utf-8 decoding raise. `manifest.py` reads it as latin-1, which cannot fail.
+
+
+## Releases
+
+A release is everything training needs for one organism, under one dated
+directory, with nothing outside it:
+
+```
+data/hg38/
+  latest -> releases/2026-08          # the only thing that decides what runs read
+  releases/2026-08/
+    MANIFEST.json
+    genome/    genome.fa  blacklist.bed  sequence.pkl  chrom.sizes
+    signal/    <antigen class>/<tissue>/<antigen>.bedgraph
+    chunks/    dna/<chrom>/<start>_<end>.txt
+               omics/<tissue>/<chrom>.parquet
+    index/     tissues.json  features.json  availability.json
+               chunk_grid.parquet  windows_<W>.parquet
+               track_weights.npz  omics_pairs.npz  groups.tsv
+```
+
+**Why versioned.** Nothing on disk used to say which ChIP-Atlas snapshot
+`data/hg38` came from. It turned out to be a 2021 metadata dump against 2024
+peaks, dropping 3.2% of hg38 peaks as unrecognised accessions, and the only tell
+was a suspiciously large `NA/Blood/NA.bed`. A release id in the path makes the
+snapshot part of every filename a run touches, and rollback one `ln -sfn`.
+
+**The manifest carries its own path templates.** This repository writes releases
+and the training repo reads them. Rather than each holding a copy of the same
+twenty path strings and drifting apart silently, every release states its layout
+in `MANIFEST.json`:
+
+```json
+"paths": {"dna_chunk": "chunks/dna/{chrom}/{start}_{end}.txt", ...},
+"omics_layout": "chrom-parquet",
+"interval_layout": "split-column"
+```
+
+A reader formats those templates, so the data describes itself and old releases
+stay readable after the layout moves on. That is what lets the migrated 2021
+release keep its ~900,000 per-chunk omics pickles and its 4.9 GB interval
+pickles while new releases use 475 parquet files and one window table per size:
+the two declare different templates and the same reader handles both.
+
+## The split
+
+Validation is **chr8 + chr9, held out whole** — 9.18% of hg38 and 9.32% of
+mm10, the closest any pair gets to a tenth on both assemblies at once. Whole
+chromosomes, so no validation window shares a regulatory neighbourhood with a
+training one.
+
+Test is **10% of what remains**, drawn at the interval level: validation already
+costs a tenth of the genome, and spending two more whole chromosomes on test
+would take a fifth of the training signal.
+
+The split is assigned on **2**20 blocks and inherited downward**. Assigning it
+per window independently would put an 8192 window in train while the 65536
+window containing it is in test — the same bases on both sides of the split.
+Because 8192 and 65536 both divide 2**20, a block-level assignment nests
+exactly, so all three window sizes agree about which stretches of genome are
+held out. `verify` checks it: no locus may appear in two splits.
+
+This also reconciles a real disagreement. `build_omics_pairs.py` held out
+chr8/chr9 while `train/test_intervals_*.pkl` split *within* every chromosome, so
+two artifacts feeding the same run disagreed about what "held out" meant.
+`pairs` now reads the `split` column rather than re-deriving it.
+
+## Omics storage: 475 files, not 900,000
+
+The 2021 tree stored one pickle per (tissue, chromosome, chunk) — about 900,000
+files per organism, enough that `du` times out. New releases store one parquet
+per (tissue, chromosome) with **a row group per chunk**, and the chunk → row
+group map in the file footer:
+
+```python
+handle = pq.ParquetFile(path)
+present = json.loads(handle.schema_arrow.metadata[b"chipatlas_forge:chunks"])
+rows = handle.read_row_group(present.index(chunk))
+```
+
+Same O(1) access to one chunk, 1/1900th the file count. A peak crossing a chunk
+boundary is stored in **both** chunks with its true coordinates uncut — the read
+path clips to the window and de-duplicates, and storing clipped copies would
+silently shorten every boundary-crossing peak.
+
+## Run the prepare stages
+
+```bash
+# after run_all.sh has finished stages 1-5
+ORG=hg38 RELEASE=2026-08 slurm/run_prepare.sh
+
+# promote only once verify exits 0
+ORG=hg38 RELEASE=2026-08 PROMOTE=1 slurm/run_prepare.sh
+```
+
+Everything is chained with `--dependency=afterok`, and promotion is opt-in and
+last: `latest` is what every training job resolves, so moving it is the single
+action that changes what runs read.
+
+## Filing the pre-release tree as a release
+
+`migrate` turns `data/<org>/{DNA,OMICS,Subtables,SupportFiles}` into a release
+without rewriting any of it — every move is an `os.rename`, so 152 GB and
+900,000 files take the same instant as one file. What changes is the naming:
+`Bld` becomes `Blood` and `His` becomes `Histone`, using the code table derived
+from ChIP-Atlas's own `fileList.tab` rather than a hardcoded map.
+
+It is destructive and one-way, so it prints its plan and stops:
+
+```bash
+python -m chipatlas_forge.migrate --data-dir ../ --org hg38 --release 2021-10
+python -m chipatlas_forge.migrate --data-dir ../ --org hg38 --release 2021-10 --execute
+```
+
+## Vocabulary is frozen by default
+
+The omics head's output dimension is the feature count rounded up to a power of
+two, so changing the vocabulary makes every existing checkpoint architecturally
+unloadable. `--freeze-features` pins the feature list to an existing release's;
+features that vanished from the new data are kept as columns that are never
+available in any tissue, because dropping them would renumber every column after
+them — the same incompatibility by another name.
+
+Refreshing the vocabulary is a deliberate act with a retraining budget attached,
+not something a data rebuild does on its own.
