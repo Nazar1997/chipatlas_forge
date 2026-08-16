@@ -755,6 +755,52 @@ def test_dna_chunks_can_be_linked_from_a_bare_tree(toy, tmp_path):
     assert linked.read_text() == toy["sequence"]["chr1"][:65536].upper()
 
 
+def test_a_bare_tree_missing_the_final_chunk_is_cut_instead(toy, tmp_path):
+    """The 2021 tree is not a clean tiling and cannot supply every chunk.
+
+    Its final chunk per chromosome was pulled BACK to keep a full 65,536 bases,
+    so chr1 ends at 248890886_248956422 rather than 248905728_248956422 and the
+    last two overlap. A release tiles cleanly -- chunk index is
+    start // chunk_size, which the parquet row-group mapping depends on -- so
+    the names that cannot match are cut from the sequence rather than bending
+    the grid to fit them.
+    """
+    release = toy["release"]
+    bare = tmp_path / "dna"
+    written_short = []
+    for chrom, length in release.manifest["chrom_sizes"].items():
+        for start in range(0, length, release.chunk_size):
+            end = min(start + release.chunk_size, length)
+            if end - start < release.chunk_size:
+                written_short.append((chrom, start, end))
+                continue                      # exactly what the old tree lacks
+            target = bare / chrom / ("%d_%d.txt" % (start, end))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(release.dna_chunk(chrom, start, end).read_text())
+    assert written_short, "fixture must have at least one short final chunk"
+
+    data = tmp_path / "data"
+    fresh = layout.Release.create(data, "toy", "2027-02")
+    fresh.manifest["chrom_sizes"] = release.manifest["chrom_sizes"]
+    for stage in ("vocab", "intervals"):
+        fresh.record(stage, inherited="test fixture")
+    fresh.record("genome", inherited="test fixture")
+    genome.adopt(release.path("sequence"), fresh.path("sequence"))
+
+    assert chunks.main(["--data-dir", str(data), "--org", "toy",
+                        "--release", "2027-02", "--what", "dna",
+                        "--dna-dir", str(bare)]) == 0
+    fresh = layout.Release.open(data, "toy", "2027-02")
+    stats = fresh.manifest["stages"]["chunks_dna"]
+    assert stats["written"] == len(written_short), "short chunks must be cut"
+    assert stats["linked"] == stats["chunks"] - stats["written"]
+
+    for chrom, start, end in written_short:
+        got = fresh.dna_chunk(chrom, start, end).read_text()
+        assert got == toy["sequence"][chrom][start:end].upper()
+        assert len(got) == end - start
+
+
 def test_dna_source_options_are_mutually_exclusive(toy, tmp_path):
     with pytest.raises(SystemExit):
         chunks.main(["--data-dir", str(toy["data"]), "--org", "toy",

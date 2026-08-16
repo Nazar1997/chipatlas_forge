@@ -278,7 +278,8 @@ def build_dna(release, chroms, chunk_size, donor=None, dna_dir=None):
     """
     totals = {"chunks": 0, "linked": 0, "written": 0}
     if donor is not None or dna_dir is not None:
-        source_name = donor.id if donor is not None else str(dna_dir)
+        # Loaded only if something has to be cut, because it is ~1 GB.
+        sequence = None
         for chrom in sorted(chroms):
             length = chroms[chrom]
             for start in range(0, length, chunk_size):
@@ -287,14 +288,25 @@ def build_dna(release, chroms, chunk_size, donor=None, dna_dir=None):
                     source = donor.dna_chunk(chrom, start, end)
                 else:
                     source = Path(dna_dir) / chrom / ("%d_%d.txt" % (start, end))
-                if not source.exists():
-                    raise SystemExit(
-                        "%s has no chunk %s:%d-%d -- its grid does not match "
-                        "this release's %d bp chunks"
-                        % (source_name, chrom, start, end, chunk_size))
-                adopt(source, release.dna_chunk(chrom, start, end))
                 totals["chunks"] += 1
-                totals["linked"] += 1
+                if source.exists():
+                    adopt(source, release.dna_chunk(chrom, start, end))
+                    totals["linked"] += 1
+                    continue
+                # The 2021 tree is not a clean tiling: its final chunk per
+                # chromosome was pulled BACK to keep a full 65,536 bases, so
+                # chr1 ends at 248890886_248956422 rather than
+                # 248905728_248956422 and the last two overlap. A release tiles
+                # cleanly -- chunk index is start // chunk_size, which the
+                # parquet row-group mapping depends on -- so the handful of
+                # names that cannot match are cut from the sequence instead of
+                # bending the grid to fit them.
+                if sequence is None:
+                    sequence = load_sequence(release.path("sequence"))
+                target = release.dna_chunk(chrom, start, end)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(sequence[chrom][start:end].upper())
+                totals["written"] += 1
         return totals
 
     sequence = load_sequence(release.path("sequence"))
