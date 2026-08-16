@@ -630,3 +630,42 @@ def test_adopt_refuses_when_the_peak_stages_have_not_run(tmp_path):
         adopt.main(["--root", str(tmp_path / "forge"),
                     "--data-dir", str(tmp_path / "data"),
                     "--org", "toy", "--release", "2026-08"])
+
+
+def test_dna_chunks_can_be_linked_from_a_bare_tree(toy, tmp_path):
+    """Building a release must not require migrating the tree still being read.
+
+    A run in flight holds the pre-release `Subtables/dna`, so the new release
+    links from it rather than copying or waiting for a maintenance window.
+    """
+    release = toy["release"]
+    bare = tmp_path / "Subtables" / "dna"
+    for chrom, length in release.manifest["chrom_sizes"].items():
+        for start in range(0, length, release.chunk_size):
+            end = min(start + release.chunk_size, length)
+            target = bare / chrom / ("%d_%d.txt" % (start, end))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(release.dna_chunk(chrom, start, end).read_text())
+
+    data = tmp_path / "data"
+    fresh = layout.Release.create(data, "toy", "2027-01")
+    fresh.manifest["chrom_sizes"] = release.manifest["chrom_sizes"]
+    for stage in ("genome", "vocab", "intervals"):
+        fresh.record(stage, inherited="test fixture")
+
+    assert chunks.main(["--data-dir", str(data), "--org", "toy",
+                        "--release", "2027-01", "--what", "dna",
+                        "--dna-dir", str(bare)]) == 0
+    fresh = layout.Release.open(data, "toy", "2027-01")
+    assert fresh.manifest["stages"]["chunks_dna"]["linked"] > 0
+    assert fresh.manifest["stages"]["chunks_dna"]["written"] == 0, "should link, not copy"
+    linked = fresh.dna_chunk("chr1", 0, 65536)
+    assert linked.samefile(bare / "chr1" / "0_65536.txt")
+    assert linked.read_text() == toy["sequence"]["chr1"][:65536].upper()
+
+
+def test_dna_source_options_are_mutually_exclusive(toy, tmp_path):
+    with pytest.raises(SystemExit):
+        chunks.main(["--data-dir", str(toy["data"]), "--org", "toy",
+                     "--release", "2026-08", "--what", "dna",
+                     "--from-release", "2026-08", "--dna-dir", str(tmp_path)])

@@ -253,25 +253,36 @@ def build_omics(release, tissue, features, chroms, chunk_size, block_size):
     return totals
 
 
-def build_dna(release, chroms, chunk_size, donor=None):
-    """One uppercase text file per chunk, adopted from a donor release if given.
+def build_dna(release, chroms, chunk_size, donor=None, dna_dir=None):
+    """One uppercase text file per chunk, adopted from an existing cut if given.
 
     The reference does not change between releases, so a rebuild links to the
-    chunks an earlier release already cut -- 47,000 hard links instead of
-    47,000 slices of a 3.1 GB pickle.
+    chunks something else already cut -- 47,000 hard links instead of 47,000
+    slices of a 3.1 GB pickle.
+
+    ``dna_dir`` names a bare ``<chrom>/<start>_<end>.txt`` tree rather than a
+    release. That is what allows a new release to be built while the
+    pre-release tree is still in place and still being read by a running job:
+    linking only reads the source directory, so nothing has to be migrated
+    first, and a hard link means the new release does not duplicate the 3 GB
+    either.
     """
     totals = {"chunks": 0, "linked": 0, "written": 0}
-    if donor is not None:
+    if donor is not None or dna_dir is not None:
+        source_name = donor.id if donor is not None else str(dna_dir)
         for chrom in sorted(chroms):
             length = chroms[chrom]
             for start in range(0, length, chunk_size):
                 end = min(start + chunk_size, length)
-                source = donor.dna_chunk(chrom, start, end)
+                if donor is not None:
+                    source = donor.dna_chunk(chrom, start, end)
+                else:
+                    source = Path(dna_dir) / chrom / ("%d_%d.txt" % (start, end))
                 if not source.exists():
                     raise SystemExit(
                         "%s has no chunk %s:%d-%d -- its grid does not match "
                         "this release's %d bp chunks"
-                        % (donor.id, chrom, start, end, chunk_size))
+                        % (source_name, chrom, start, end, chunk_size))
                 adopt(source, release.dna_chunk(chrom, start, end))
                 totals["chunks"] += 1
                 totals["linked"] += 1
@@ -301,6 +312,11 @@ def main(argv=None):
     parser.add_argument("--from-release", default=None,
                         help="dna only: adopt chunks from this release instead "
                              "of cutting them out of sequence.pkl")
+    parser.add_argument("--dna-dir", type=Path, default=None,
+                        help="dna only: adopt chunks from a bare "
+                             "<chrom>/<start>_<end>.txt tree, e.g. a pre-release "
+                             "Subtables/dna. Lets a release be built before the "
+                             "old tree is migrated, and while it is still in use")
     parser.add_argument("--task", default="env",
                         help="task index, 'all', or 'env' for SLURM_ARRAY_TASK_ID")
     parser.add_argument("--tasks", type=int, default=1)
@@ -314,8 +330,11 @@ def main(argv=None):
     if args.what == "dna":
         donor = (layout.Release.open(args.data_dir, args.org, args.from_release)
                  if args.from_release else None)
+        if donor is not None and args.dna_dir is not None:
+            raise SystemExit("pass --from-release or --dna-dir, not both")
         started = time.time()
-        totals = build_dna(release, chroms, release.chunk_size, donor)
+        totals = build_dna(release, chroms, release.chunk_size, donor,
+                           args.dna_dir)
         totals["seconds"] = round(time.time() - started, 1)
         release.record("chunks_dna", **totals)
         print("dna: %(chunks)d chunks (%(linked)d linked, %(written)d written)"
