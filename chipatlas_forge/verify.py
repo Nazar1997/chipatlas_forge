@@ -126,6 +126,31 @@ def verify_vocabulary_is_backed_by_data(release, report, chroms, availability):
     return {"tissues": len(availability), "empty": empty}
 
 
+def verify_every_claimed_feature_is_reachable(release, report, availability,
+                                              features, aliases):
+    """Every feature some tissue claims must resolve to a file on disk.
+
+    The tissue-level check above counts rows per tissue, so one unreachable
+    feature among hundreds is invisible to it -- which is exactly how
+    `H3PERIOD3_K27M_mutant` stayed missing after the directory bug was fixed:
+    its file is `H3.3_K27M_mutant.bedgraph`, matching neither its vocabulary
+    name nor its alias.
+
+    Resolved through `signal_files`, so this asserts the lookup the chunk stage
+    actually uses can find every column the vocabulary promises.
+    """
+    claimed = set().union(*availability.values()) if availability else set()
+    reachable = set()
+    for tissue in availability:
+        reachable |= set(signal_files(release, tissue, features, aliases))
+    missing = sorted(claimed - reachable)
+    report.check(not missing,
+                 "%d vocabulary feature(s) are claimed by a tissue but no signal "
+                 "file resolves to them: %s"
+                 % (len(missing), ", ".join(missing[:10])))
+    return {"claimed": len(claimed), "unreachable": missing}
+
+
 def verify_dna(release, report, chroms):
     """Every chunk the grid names exists and is exactly as long as its name says."""
     size = release.chunk_size
@@ -257,6 +282,14 @@ def main(argv=None):
         print("  vocab:   %d tissues, %d with no omics rows%s"
               % (summary["vocabulary"]["tissues"], len(empty),
                  ": " + ", ".join(empty) if empty else ""), flush=True)
+        summary["features"] = verify_every_claimed_feature_is_reachable(
+            release, report, availability, features,
+            json.loads(release.path("features").read_text()).get("aliases"))
+        unreachable = summary["features"]["unreachable"]
+        print("  feature: %d claimed, %d unreachable%s"
+              % (summary["features"]["claimed"], len(unreachable),
+                 ": " + ", ".join(unreachable[:6]) if unreachable else ""),
+              flush=True)
     summary["dna"] = verify_dna(release, report, chroms)
     print("  dna:     %(chunks)d chunks, %(missing)d missing, "
           "%(wrong_length)d wrong length" % summary["dna"], flush=True)

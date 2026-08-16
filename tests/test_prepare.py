@@ -1034,3 +1034,24 @@ def test_signal_files_finds_the_awkward_alias_on_disk(toy):
         assert set(found) == {"H3PERIOD3_K27M_mutant"}
     finally:
         path.unlink()
+
+
+def test_verify_catches_a_feature_no_file_resolves_to(toy):
+    """One unreachable column among hundreds is invisible to a per-tissue count."""
+    release = toy["release"]
+    avail = json.loads(release.availability().read_text())
+    saved = release.availability().read_text()
+    features_blob = json.loads(release.path("features").read_text())
+    saved_features = release.path("features").read_text()
+    try:
+        # Claim a feature that has no signal file anywhere.
+        avail["Blood"] = sorted(set(avail["Blood"]) | {"GHOST_ANTIGEN"})
+        release.availability().write_text(json.dumps(avail))
+        features_blob["features"] = features_blob["features"] + ["GHOST_ANTIGEN"]
+        release.path("features").write_text(json.dumps(features_blob))
+        rc = verify.main(["--data-dir", str(toy["data"]), "--org", "toy",
+                          "--release", "2026-08", "--sample", "0"])
+    finally:
+        release.availability().write_text(saved)
+        release.path("features").write_text(saved_features)
+    assert rc == 1, "verify passed a release with an unreachable feature"
