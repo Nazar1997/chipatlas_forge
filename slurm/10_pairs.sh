@@ -17,8 +17,17 @@ source "${FORGE_ENV:-$(cd "$(dirname "$0")" && pwd)/_env.sh}"
 cd "$ROOT"
 ORG="${ORG:?set ORG=hg38 or ORG=mm10}"
 echo "host=$(hostname) org=$ORG release=$RELEASE started=$(date)"
+# An array, not a bare expansion: the default tissue is "All cell types" and an
+# unquoted ${VAR:-...} word-splits it into three arguments, which argparse then
+# reports as three unknown tissues. Set PAIR_TISSUES to a whitespace-free name,
+# or edit this array, to profile against something else.
+if [[ -n "${PAIR_TISSUES:-}" ]]; then
+    read -r -a pair_tissues <<< "$PAIR_TISSUES"
+else
+    pair_tissues=("All cell types")
+fi
 $PY -m chipatlas_forge.pairs \
     --data-dir "$DATA_DIR" --org "$ORG" --release "$RELEASE" \
-    --tissues ${PAIR_TISSUES:-"All cell types"} \
+    --tissues "${pair_tissues[@]}" \
     --pair_bp "${PAIR_BP:-8192}"
 echo "finished=$(date)"
