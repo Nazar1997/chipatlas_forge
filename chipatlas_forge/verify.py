@@ -141,7 +141,8 @@ def verify_windows(release, report, chroms):
     return out
 
 
-def verify_sampled_chunks(release, report, chroms, tissues, features, n, seed):
+def verify_sampled_chunks(release, report, chroms, tissues, features, n, seed,
+                          aliases=None):
     """Re-derive sampled chunks straight from `signal/` and compare row for row.
 
     The only check that can catch a wrong *value* rather than a missing file.
@@ -169,7 +170,7 @@ def verify_sampled_chunks(release, report, chroms, tissues, features, n, seed):
             # One tissue-chromosome of bedGraphs is the memory high-water mark
             # here; drop the previous one before pulling in another.
             cache.clear()
-            files = signal_files(release, tissue, features)
+            files = signal_files(release, tissue, features, aliases)
             cache[key] = {a: read_bedgraph(p, {chrom}, 8 << 20).get(chrom)
                           for a, p in files.items()}
         expected = []
@@ -234,7 +235,8 @@ def main(argv=None):
 
     if args.sample and release.omics_layout == layout.CHROM_PARQUET:
         summary["sampled"] = verify_sampled_chunks(
-            release, report, chroms, tissues, features, args.sample, args.seed)
+            release, report, chroms, tissues, features, args.sample, args.seed,
+            json.loads(release.path("features").read_text()).get("aliases"))
         print("  sampled: %(sampled)d chunks re-derived from signal/, "
               "%(mismatched)d mismatched" % summary["sampled"], flush=True)
 

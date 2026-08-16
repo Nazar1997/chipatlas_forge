@@ -154,20 +154,91 @@ def select(groups, min_antigens=MIN_ANTIGENS_PER_TISSUE,
     return tissues, antigens, availability, rounds
 
 
-def apply_freeze(frozen, antigens, availability):
-    """Keep the frozen column order; report what moved underneath it.
+def raw_pairs(groups, excluded_antigens=EXCLUDED_ANTIGENS,
+              excluded_ag_classes=EXCLUDED_AG_CLASSES):
+    """Every (tissue, antigen) the data has, with no thresholds applied."""
+    usable = groups[
+        ~groups["ag_class"].isin(excluded_ag_classes)
+        & ~groups["antigen"].isin(excluded_antigens)
+    ]
+    return set(zip(usable["ct_class"], usable["antigen"]))
 
-    Returns the frozen list unchanged -- that is the point -- along with the
-    antigens that vanished from the data (kept as permanently-unavailable
-    columns) and the ones that appeared and are being left out.
+
+def canonical(name):
+    """A form in which the 2021 vocabulary's mangled names match the real ones.
+
+    The old preparation parsed `05.<antigen>.AllCell.bed` by splitting on ".",
+    so an antigen whose name contains a dot could not survive a round trip.
+    Something upstream substituted the literal string ``PERIOD`` for it, and
+    spaces became underscores, leaving the frozen vocabulary holding
+    ``H2APERIODX``, ``H3PERIOD3_K27M_mutant`` and ``RNA_polymerase_II`` where
+    ChIP-Atlas says ``H2A.X``, ``H3.3 K27M mutant`` and ``RNA polymerase II``.
+
+    Those are not missing tracks; they are the same tracks under a corrupted
+    name. 16 of hg38's 17 and 10 of mm10's 11 apparently-absent frozen features
+    are this, and without the mapping their columns would be permanently
+    all-zero.
     """
-    present = set(antigens)
-    vanished = [a for a in frozen if a not in present]
-    appeared = sorted(present - set(frozen))
+    return name.replace("PERIOD", ".").replace("_", " ").strip().lower()
+
+
+def resolve_aliases(frozen, present):
+    """``{frozen name: name in the data}`` for names that only differ by mangling.
+
+    Only unambiguous matches are accepted -- if two data antigens share a
+    canonical form, neither is used, because guessing wrong here silently feeds
+    one track's peaks into another track's column.
+    """
+    by_canonical = {}
+    for name in present:
+        by_canonical.setdefault(canonical(name), []).append(name)
+    aliases, ambiguous = {}, {}
+    for name in frozen:
+        if name in present:
+            continue
+        candidates = by_canonical.get(canonical(name), [])
+        if len(candidates) == 1:
+            aliases[name] = candidates[0]
+        elif len(candidates) > 1:
+            ambiguous[name] = sorted(candidates)
+    return aliases, ambiguous
+
+
+def apply_freeze(frozen, pairs, aliases, min_antigens):
+    """Availability for a frozen vocabulary, with the thresholds NOT re-applied.
+
+    This is the subtle one. The antigen threshold ("must appear in >= 3
+    tissues") exists to *choose* a vocabulary. Once the vocabulary is frozen the
+    choice has already been made, and re-running the filter over new data
+    answers a question nobody asked: on hg38 it marked 395 of 1,009 frozen
+    features as absent, of which 392 have data in exactly two tissues. Those
+    columns exist in every checkpoint and have real peaks behind them; zeroing
+    39% of the target matrix because the new snapshot's tissue counts shifted
+    would be a large, silent regression.
+
+    So a frozen feature is available wherever it has data, full stop. The tissue
+    threshold still applies -- a tissue with almost nothing in the frozen
+    vocabulary really is not worth a column.
+    """
     allowed = set(frozen)
-    trimmed = {t: [a for a in feats if a in allowed]
-               for t, feats in availability.items()}
-    return list(frozen), trimmed, vanished, appeared
+    to_frozen = {data: name for name, data in aliases.items()}
+
+    availability = defaultdict(set)
+    for tissue, antigen in pairs:
+        name = to_frozen.get(antigen, antigen)
+        if name in allowed:
+            availability[tissue].add(name)
+
+    tissues = sorted(t for t, feats in availability.items()
+                     if len(feats) >= min_antigens)
+    thin = sorted(t for t in availability if t not in set(tissues))
+    trimmed = {t: sorted(availability[t]) for t in tissues}
+
+    covered = set().union(*trimmed.values()) if trimmed else set()
+    vanished = [a for a in frozen if a not in covered]
+    appeared = sorted({a for _, a in pairs}
+                      - allowed - set(aliases.values()))
+    return list(frozen), trimmed, tissues, thin, vanished, appeared
 
 
 def main(argv=None):

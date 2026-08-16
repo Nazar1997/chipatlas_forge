@@ -75,30 +75,39 @@ def out_schema():
     ])
 
 
-def signal_files(release, tissue, features):
+def signal_files(release, tissue, features, aliases=None):
     """Every bedGraph for one tissue whose antigen is in the vocabulary.
 
     Walks `signal/<ag class>/<tissue>/<antigen>.bedgraph` across all antigen
     classes, so a tissue's histone marks and its transcription factors arrive
     together as one flat feature list -- the class is a grouping for humans, not
     a dimension of the target matrix.
+
+    Keys are **vocabulary** names, not filenames. `aliases` maps the two apart
+    for features whose 2021 name was mangled (`H2APERIODX` for `H2A.X`), so the
+    file is found under its real name and the peaks are still filed under the
+    column the model has. Without it those columns silently stay empty.
     """
     root = release.path("signal_root")
     if not root.is_dir():
         raise SystemExit("%s does not exist -- run binmax into the release first"
                          % root)
-    wanted = set(features)
+    # filename stem -> vocabulary name
+    from_file = {name: name for name in features}
+    for name, data_name in (aliases or {}).items():
+        from_file[data_name] = name
     found = {}
     for ag_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         path = ag_dir / tissue
         if not path.is_dir():
             continue
         for bedgraph in sorted(path.glob("*.bedgraph")):
-            if bedgraph.stem in wanted:
+            name = from_file.get(bedgraph.stem)
+            if name is not None:
                 # An antigen can appear under two classes; either file is the
                 # same measurement, so first wins and the duplicate is skipped
                 # rather than concatenated into a doubled track.
-                found.setdefault(bedgraph.stem, bedgraph)
+                found.setdefault(name, bedgraph)
     return found
 
 
@@ -230,9 +239,10 @@ def write_tissue_chromosome(release, tissue, chrom, tracks, features, chunk_size
             "bytes": target.stat().st_size}
 
 
-def build_omics(release, tissue, features, chroms, chunk_size, block_size):
+def build_omics(release, tissue, features, chroms, chunk_size, block_size,
+                aliases=None):
     """Every chromosome's parquet for one tissue, reading each bedGraph once."""
-    files = signal_files(release, tissue, features)
+    files = signal_files(release, tissue, features, aliases)
     if not files:
         print("  %s: no signal files for any vocabulary antigen" % tissue,
               flush=True)
@@ -341,7 +351,9 @@ def main(argv=None):
               " in %(seconds)ss" % totals, flush=True)
         return 0
 
-    features = json.loads(release.path("features").read_text())["features"]
+    vocabulary = json.loads(release.path("features").read_text())
+    features = vocabulary["features"]
+    aliases = vocabulary.get("aliases") or {}
     tissues = [t["name"] for t in
                json.loads(release.path("tissues").read_text())["tissues"]]
 
@@ -357,7 +369,7 @@ def main(argv=None):
     for tissue in mine:
         at = time.time()
         totals = build_omics(release, tissue, features, chroms,
-                             release.chunk_size, args.block_size)
+                             release.chunk_size, args.block_size, aliases)
         totals["seconds"] = round(time.time() - at, 1)
         (stats_dir / ("%s.json" % tissue)).write_text(json.dumps(totals))
         print("  %-28s %4d tracks  %10d rows  %6.1f MB  %ss"

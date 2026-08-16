@@ -201,14 +201,81 @@ def test_vocab_derives_class_codes_from_filelist(toy):
 
 def test_freezing_keeps_column_order_and_reports_the_drift():
     frozen = ["KEPT", "GONE"]
-    antigens = ["KEPT", "BRAND_NEW"]
-    availability = {"Blood": ["KEPT", "BRAND_NEW"]}
-    out, trimmed, vanished, appeared = vocab.apply_freeze(
-        frozen, antigens, availability)
+    pairs = {("Blood", "KEPT"), ("Blood", "BRAND_NEW")}
+    out, trimmed, tissues, thin, vanished, appeared = vocab.apply_freeze(
+        frozen, pairs, {}, min_antigens=1)
     assert out == frozen, "the frozen order must survive verbatim"
     assert vanished == ["GONE"], "a frozen feature absent from the data is kept"
     assert appeared == ["BRAND_NEW"], "a new feature is reported, not silently added"
     assert trimmed["Blood"] == ["KEPT"]
+    assert tissues == ["Blood"] and thin == []
+
+
+def test_freezing_does_not_re_apply_the_antigen_threshold():
+    """The threshold picks a vocabulary; a frozen one has already been picked.
+
+    On real hg38 this was 395 of 1,009 columns -- 392 of them with data in
+    exactly two tissues -- marked absent and zeroed for no reason.
+    """
+    frozen = ["ONLY_TWO_TISSUES"]
+    pairs = {("Blood", "ONLY_TWO_TISSUES"), ("Liver", "ONLY_TWO_TISSUES")}
+    _, trimmed, tissues, _, vanished, _ = vocab.apply_freeze(
+        frozen, pairs, {}, min_antigens=1)
+    assert vanished == [], "a two-tissue frozen feature still has data"
+    assert sorted(tissues) == ["Blood", "Liver"]
+    assert trimmed["Blood"] == ["ONLY_TWO_TISSUES"]
+
+
+def test_the_old_dot_mangling_is_undone():
+    """`H2APERIODX` and `H2A.X` are the same track under a corrupted name."""
+    frozen = ["H2APERIODX", "RNA_polymerase_II", "H3PERIOD3_K27M_mutant"]
+    present = {"H2A.X", "RNA polymerase II", "H3.3 K27M mutant", "CTCF"}
+    aliases, ambiguous = vocab.resolve_aliases(frozen, present)
+    assert not ambiguous
+    assert aliases == {"H2APERIODX": "H2A.X",
+                       "RNA_polymerase_II": "RNA polymerase II",
+                       "H3PERIOD3_K27M_mutant": "H3.3 K27M mutant"}
+
+
+def test_an_ambiguous_alias_is_refused_rather_than_guessed():
+    """Guessing wrong feeds one track's peaks into another track's column.
+
+    `H2A.X` and `H2A.x` share a canonical form, so neither may be chosen.
+    """
+    aliases, ambiguous = vocab.resolve_aliases(
+        ["H2APERIODX"], {"H2A.X", "H2A.x"})
+    assert aliases == {}, "an ambiguous name must not be mapped at all"
+    assert ambiguous == {"H2APERIODX": ["H2A.X", "H2A.x"]}
+
+
+def test_canonical_does_not_collapse_genuinely_different_names():
+    """It must be loose enough to match the mangling and no looser."""
+    assert vocab.canonical("H2APERIODX") == vocab.canonical("H2A.X")
+    assert vocab.canonical("RNA_polymerase_II") == vocab.canonical("RNA polymerase II")
+    assert vocab.canonical("H3.3") != vocab.canonical("H3_3")
+    assert vocab.canonical("CTCF") != vocab.canonical("CTCFL")
+
+
+def test_aliased_features_are_available_under_their_vocabulary_name():
+    frozen = ["H2APERIODX"]
+    pairs = {("Blood", "H2A.X")}
+    _, trimmed, tissues, _, vanished, appeared = vocab.apply_freeze(
+        frozen, pairs, {"H2APERIODX": "H2A.X"}, min_antigens=1)
+    assert vanished == [], "the alias should have found the data"
+    assert trimmed["Blood"] == ["H2APERIODX"], "filed under the model's column name"
+    assert appeared == [], "the data name is not also reported as new"
+
+
+def test_signal_files_are_found_through_an_alias(toy):
+    """The file is named H2A.X; the column is called H2APERIODX."""
+    release = toy["release"]
+    path = (release.path("signal_root") / "Histone" / "Blood" / "H2A.X.bedgraph")
+    path.write_text("chr1\t0\t10\t500\n")
+    found = chunks.signal_files(release, "Blood", ["H2APERIODX"],
+                                {"H2APERIODX": "H2A.X"})
+    assert set(found) == {"H2APERIODX"}, "keyed by vocabulary name, not filename"
+    assert found["H2APERIODX"].name == "H2A.X.bedgraph"
+    path.unlink()
 
 
 def test_select_converges_when_the_thresholds_interact():
