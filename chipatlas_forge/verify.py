@@ -92,6 +92,40 @@ def verify_omics(release, report, chroms, tissues):
     return {"rows": rows, "row_groups": groups, "missing": len(missing)}
 
 
+def verify_vocabulary_is_backed_by_data(release, report, chroms, availability):
+    """Every tissue the vocabulary claims features for must actually have rows.
+
+    The check that was missing. `verify_sampled_chunks` re-derives a chunk
+    through the *same* `signal_files` lookup that built it, so a lookup bug is
+    invisible to it -- expected and actual are both empty and it reports a
+    match. That is exactly what happened: five multi-word tissues
+    ("Pluripotent stem cell", "Digestive tract", "Embryonic fibroblast", ...)
+    got empty parquet because the directories on disk are slugified, and a
+    release passed 760,779 checks with ~1,500 features silently unavailable.
+
+    Cross-checking against the vocabulary instead of against the lookup is what
+    makes it catchable: `availability.json` says the tissue has N features, and
+    a tissue with features but no rows anywhere is a contradiction.
+    """
+    empty = []
+    for tissue, features in sorted(availability.items()):
+        if not features:
+            continue
+        rows = 0
+        for chrom in chroms:
+            path = release.omics_chunk(tissue, chrom)
+            if path.exists():
+                rows += pq.ParquetFile(path).metadata.num_rows
+            if rows:
+                break
+        report.check(rows > 0,
+                     "tissue %r has %d features in the vocabulary but no omics "
+                     "rows on any chromosome" % (tissue, len(features)))
+        if not rows:
+            empty.append(tissue)
+    return {"tissues": len(availability), "empty": empty}
+
+
 def verify_dna(release, report, chroms):
     """Every chunk the grid names exists and is exactly as long as its name says."""
     size = release.chunk_size
@@ -215,6 +249,14 @@ def main(argv=None):
           flush=True)
 
     summary = {}
+    if release.availability().exists():
+        availability = json.loads(release.availability().read_text())
+        summary["vocabulary"] = verify_vocabulary_is_backed_by_data(
+            release, report, chroms, availability)
+        empty = summary["vocabulary"]["empty"]
+        print("  vocab:   %d tissues, %d with no omics rows%s"
+              % (summary["vocabulary"]["tissues"], len(empty),
+                 ": " + ", ".join(empty) if empty else ""), flush=True)
     summary["dna"] = verify_dna(release, report, chroms)
     print("  dna:     %(chunks)d chunks, %(missing)d missing, "
           "%(wrong_length)d wrong length" % summary["dna"], flush=True)

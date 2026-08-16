@@ -47,6 +47,7 @@ import pyarrow.parquet as pq
 from . import arrow_compat as compat
 from . import layout
 from .genome import adopt, load_sequence
+from .keys import slugify
 
 BEDGRAPH_COLUMNS = ["chrom", "start", "end", "value"]
 
@@ -82,24 +83,29 @@ def signal_files(release, tissue, features, aliases=None):
     together as one flat feature list -- the class is a grouping for humans, not
     a dimension of the target matrix.
 
+    **Directories are matched by slug.** `keys.group_path` slugified class names
+    when the peak stages wrote them and `adopt` linked them verbatim, so a
+    tissue is `Pluripotent_stem_cell` on disk while the vocabulary calls it
+    "Pluripotent stem cell". Comparing raw names produced an empty parquet for
+    every multi-word tissue -- five of them, ~1,500 features between them -- with
+    no error anywhere, because an empty result is also what "this tissue has
+    nothing here" legitimately looks like.
+
     Keys are **vocabulary** names, not filenames. `aliases` maps the two apart
     for features whose 2021 name was mangled (`H2APERIODX` for `H2A.X`), so the
     file is found under its real name and the peaks are still filed under the
-    column the model has. Without it those columns silently stay empty.
+    column the model has.
     """
     root = release.path("signal_root")
     if not root.is_dir():
         raise SystemExit("%s does not exist -- run binmax into the release first"
                          % root)
-    # filename stem -> vocabulary name
-    from_file = {name: name for name in features}
+    from_file = {name: name for name in features}          # stem -> vocab name
     for name, data_name in (aliases or {}).items():
         from_file[data_name] = name
+
     found = {}
-    for ag_dir in sorted(p for p in root.iterdir() if p.is_dir()):
-        path = ag_dir / tissue
-        if not path.is_dir():
-            continue
+    for path in tissue_dirs(root, tissue):
         for bedgraph in sorted(path.glob("*.bedgraph")):
             name = from_file.get(bedgraph.stem)
             if name is not None:
@@ -108,6 +114,15 @@ def signal_files(release, tissue, features, aliases=None):
                 # rather than concatenated into a doubled track.
                 found.setdefault(name, bedgraph)
     return found
+
+
+def tissue_dirs(root, tissue):
+    """Every `<ag class>/<tissue>` directory holding this tissue, by slug."""
+    wanted = slugify(tissue)
+    return [d
+            for ag_dir in sorted(p for p in root.iterdir() if p.is_dir())
+            for d in sorted(ag_dir.iterdir())
+            if d.is_dir() and slugify(d.name) == wanted]
 
 
 def read_bedgraph(path, chrom_filter, block_size):

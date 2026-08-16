@@ -942,3 +942,66 @@ def test_a_plain_pickled_sequence_still_reads(tmp_path):
     with open(path, "wb") as fh:
         pickle.dump({"chr1": "ACGT"}, fh)
     assert genome.load_sequence(path) == {"chr1": "ACGT"}
+
+
+# --------------------------------------------------------------------------
+# the slugified-directory bug
+
+
+def test_signal_files_finds_a_tissue_whose_directory_is_slugified(toy):
+    """`keys.group_path` slugifies, so a multi-word tissue is not its own name.
+
+    On the real data this silently emptied five tissues -- "Pluripotent stem
+    cell", "Digestive tract", "Embryonic fibroblast" and two more, ~1,500
+    features between them -- because `signal/Histone/Pluripotent_stem_cell/`
+    does not match the vocabulary's "Pluripotent stem cell", and an empty result
+    is also what "nothing here" legitimately looks like.
+    """
+    release = toy["release"]
+    ag_dir = release.path("signal_root") / "Histone"
+    slugged = ag_dir / "Pluripotent_stem_cell"
+    slugged.mkdir(parents=True, exist_ok=True)
+    (slugged / ("%s.bedgraph" % ANTIGENS[0])).write_text("chr1\t0\t10\t500\n")
+    try:
+        found = chunks.signal_files(release, "Pluripotent stem cell", ANTIGENS)
+        assert set(found) == {ANTIGENS[0]}, "slugified directory was not found"
+        assert found[ANTIGENS[0]].parent.name == "Pluripotent_stem_cell"
+    finally:
+        (slugged / ("%s.bedgraph" % ANTIGENS[0])).unlink()
+        slugged.rmdir()
+
+
+def test_signal_files_still_finds_an_unslugified_directory(toy):
+    """`pantissue` writes the plain name, so both spellings must resolve."""
+    found = chunks.signal_files(toy["release"], PAN, ANTIGENS)
+    assert len(found) == len(ANTIGENS)
+
+
+def test_verify_catches_a_tissue_with_features_but_no_rows(toy, tmp_path):
+    """The check that the sampled comparison structurally cannot make.
+
+    `verify_sampled_chunks` re-derives through the same lookup that built the
+    chunk, so when the lookup is what is broken, expected and actual are both
+    empty and it reports a match. A release passed 760,779 checks that way with
+    ~1,500 features unavailable.
+    """
+    release = toy["release"]
+    victim = release.omics_chunk("Blood", "chr1")
+    saved = {c: release.omics_chunk("Blood", c).read_bytes()
+             for c in release.manifest["chrom_sizes"]
+             if release.omics_chunk("Blood", c).exists()}
+    try:
+        # Empty every chromosome for Blood, exactly as the slug bug did.
+        for chrom in release.manifest["chrom_sizes"]:
+            path = release.omics_chunk("Blood", chrom)
+            if path.exists():
+                import pyarrow.parquet as _pq
+                _pq.ParquetWriter(
+                    path, chunks.out_schema().with_metadata(
+                        {chunks.CHUNK_KEY: b"[]"})).close()
+        rc = verify.main(["--data-dir", str(toy["data"]), "--org", "toy",
+                          "--release", "2026-08", "--sample", "0"])
+    finally:
+        for chrom, blob in saved.items():
+            release.omics_chunk("Blood", chrom).write_bytes(blob)
+    assert rc == 1, "verify passed a release with a silently empty tissue"
