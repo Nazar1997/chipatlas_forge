@@ -669,3 +669,43 @@ def test_dna_source_options_are_mutually_exclusive(toy, tmp_path):
         chunks.main(["--data-dir", str(toy["data"]), "--org", "toy",
                      "--release", "2026-08", "--what", "dna",
                      "--from-release", "2026-08", "--dna-dir", str(tmp_path)])
+
+
+def test_groups_tsv_keeps_NA_as_a_literal_antigen_name(tmp_path):
+    """pandas' default NA list contains "NA", which is a real ChIP-Atlas value.
+
+    Left alone it comes back as float nan, which fails loudly in `sorted` but
+    would otherwise put a nan in the vocabulary. keys.py is explicit that NA is
+    a category the source keeps, not a blank.
+    """
+    data = tmp_path / "data"
+    release = layout.Release.create(data, "toy", "2026-08")
+    rows = ["group_id\tag_class\tantigen\tct_class\tn_experiments\tpath"]
+    gid = 0
+    for tissue in ("Blood", "Liver", "Neural"):
+        for antigen in ["NA"] + ["AG%03d" % i for i in range(60)]:
+            rows.append("%d\tHistone\t%s\t%s\t10\tx" % (gid, antigen, tissue))
+            gid += 1
+    release.path("groups").parent.mkdir(parents=True, exist_ok=True)
+    release.path("groups").write_text("\n".join(rows) + "\n")
+
+    frame = vocab.read_groups(release)
+    assert frame["antigen"].map(type).eq(str).all(), "a name became float nan"
+    assert "NA" in set(frame["antigen"])
+
+    tissues, antigens, _, _ = vocab.select(frame, 50, 3)
+    assert "NA" in antigens, "NA must survive as an ordinary antigen"
+    assert all(isinstance(a, str) for a in antigens)
+
+
+def test_an_empty_class_in_groups_tsv_is_rejected(tmp_path):
+    """manifest should have normalised it; a blank would slug to the same path."""
+    data = tmp_path / "data"
+    release = layout.Release.create(data, "toy", "2026-08")
+    release.path("groups").parent.mkdir(parents=True, exist_ok=True)
+    release.path("groups").write_text(
+        "group_id\tag_class\tantigen\tct_class\tn_experiments\tpath\n"
+        "0\tHistone\t\tBlood\t10\tx\n")
+    with pytest.raises(SystemExit) as excinfo:
+        vocab.read_groups(release)
+    assert "antigen" in str(excinfo.value)

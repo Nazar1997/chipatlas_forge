@@ -89,14 +89,30 @@ def read_class_codes(meta_dir):
 
 
 def read_groups(release):
-    """The manifest stage's groups.tsv, as a frame."""
+    """The manifest stage's groups.tsv, as a frame.
+
+    ``keep_default_na=False`` is load-bearing, not tidiness. `normalise_field`
+    writes the literal string ``NA`` for a genuinely-absent antigen or cell
+    type, and pandas' default NA list contains ``"NA"`` -- so without this those
+    rows come back as float ``nan``. That fails loudly here (``sorted`` cannot
+    order float against str) but would otherwise have produced a vocabulary with
+    a ``nan`` entry in it, and `keys.py` is explicit that ``NA`` is a category
+    ChIP-Atlas keeps rather than a blank.
+    """
     path = release.path("groups")
     if not path.exists():
         raise SystemExit(
             "%s is missing -- run `manifest` and copy its groups.tsv into the "
             "release, or run the prepare pipeline in order" % path)
-    return pd.read_csv(path, sep="\t", dtype={"ag_class": str, "antigen": str,
-                                              "ct_class": str})
+    frame = pd.read_csv(path, sep="\t", keep_default_na=False, na_values=[],
+                        dtype={"ag_class": str, "antigen": str, "ct_class": str})
+    for column in ("ag_class", "antigen", "ct_class"):
+        blank = frame[column].isna() | (frame[column] == "")
+        if blank.any():
+            raise SystemExit(
+                "%s has %d row(s) with an empty %s; `manifest` should have "
+                "normalised those to 'NA'" % (path, int(blank.sum()), column))
+    return frame
 
 
 def select(groups, min_antigens=MIN_ANTIGENS_PER_TISSUE,
