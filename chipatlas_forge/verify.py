@@ -17,14 +17,19 @@ earlier, not a spot check:
 * every window in every table lies inside its chromosome, and the splits
   partition the windows with nothing in two of them
 * a sample of chunks is re-derived from `signal/` and compared row for row
+* a sample of intervals taken **from `signal/` itself** is looked up in the
+  release, and must come back at no less than the value the bedGraph gives it
 
-The last one is the expensive check and the only one that can catch a wrong
-value rather than a missing file, so it is sampled rather than exhaustive.
+The last two are the expensive checks and the only ones that can catch a wrong
+value rather than a missing file, so both are sampled rather than exhaustive.
+They sample from opposite ends on purpose: by chunk, which covers the grid
+uniformly, and by bedGraph row, which cannot land anywhere empty and so cannot
+be satisfied by nothing matching nothing.
 
 Usage:
     python -m chipatlas_forge.verify --data-dir ../ --org hg38 --release 2026-08
     python -m chipatlas_forge.verify --data-dir ../ --org hg38 --release 2026-08 \\
-        --sample 200
+        --sample 200 --signal-sample 100
 """
 
 import argparse
@@ -36,6 +41,7 @@ import pyarrow.parquet as pq
 
 from . import layout, read
 from .chunks import CHUNK_KEY, read_bedgraph, signal_files
+from .pantissue import PAN_TISSUE
 
 
 class Report:
@@ -254,6 +260,123 @@ def verify_sampled_chunks(release, report, chroms, tissues, features, n, seed,
     return {"sampled": compared, "mismatched": mismatched}
 
 
+def _min_over(starts, ends, values, lo, hi):
+    """Minimum of a sorted, disjoint run-encoded track over ``[lo, hi)``.
+
+    Uncovered bases count as **0**, deliberately: a dropped run is exactly what
+    a bad merge looks like, and skipping the gap would let the surviving runs
+    vouch for a region nothing covers.
+    """
+    i = int(np.searchsorted(ends, lo, side="right"))
+    j = int(np.searchsorted(starts, hi, side="left"))
+    if i >= j:
+        return 0
+    seg_start = np.maximum(starts[i:j], lo)
+    seg_end = np.minimum(ends[i:j], hi)
+    if seg_start[0] > lo or seg_end[-1] < hi:
+        return 0                                   # uncovered at either end
+    if len(seg_start) > 1 and (seg_start[1:] > seg_end[:-1]).any():
+        return 0                                   # a hole in the middle
+    return int(values[i:j].min())
+
+
+def verify_sampled_signal_intervals(release, report, chroms, tissues, features,
+                                    n, seed, aliases=None, per_track=8,
+                                    pan_tissue=PAN_TISSUE):
+    """Sample intervals out of `signal/` and demand the release still carries them.
+
+    Anchored on a row **known to exist** rather than on a grid position that may
+    legitimately hold nothing. That is the difference from
+    `verify_sampled_chunks`: the genome is mostly empty, so a uniformly sampled
+    chunk usually compares nothing against nothing, and when the feature lookup
+    itself is broken it compares nothing against nothing and calls it a match --
+    which is how 760,779 checks passed with ~1,500 features unreachable.
+
+    Two invariants, both `>=` rather than `==`:
+
+    * **round trip** -- the stored omics over that interval must report the
+      antigen at at least the bedGraph's value. Not equality, because the read
+      path returns whole peaks and a longer one overlapping the same span may
+      legitimately score higher; what is being ruled out is a value that got
+      *lost or shrunk* -- a mis-filed row group, a feature filed under the wrong
+      column, a peak clipped at a chunk boundary.
+    * **pan-tissue dominance** -- `All cell types` is the maximum across
+      tissues, so over any per-tissue run it must be at least that run's value
+      at **every base**, gaps counted as zero. Nothing else checks the derived
+      track against real data; the toy fixture proves the merge is exact, this
+      proves it actually ran everywhere.
+    """
+    rng = np.random.default_rng(seed)
+    ordered = sorted(chroms)
+    lookup = {}
+    tracks = intervals = pan_intervals = failures = 0
+
+    for _ in range(n):
+        tissue = tissues[rng.integers(len(tissues))]
+        if tissue not in lookup:
+            lookup[tissue] = signal_files(release, tissue, features, aliases)
+        files = lookup[tissue]
+        if not files:
+            continue
+        antigen = sorted(files)[rng.integers(len(files))]
+        chrom = ordered[rng.integers(len(ordered))]
+
+        arrays = read_bedgraph(files[antigen], {chrom}, 8 << 20).get(chrom)
+        if arrays is None or not len(arrays[0]):
+            continue                # this track has nothing here; not a fault
+        starts, ends, values = arrays
+        tracks += 1
+
+        pan = None
+        if tissue != pan_tissue and pan_tissue in tissues:
+            if pan_tissue not in lookup:
+                lookup[pan_tissue] = signal_files(release, pan_tissue, features,
+                                                  aliases)
+            source = lookup[pan_tissue].get(antigen)
+            if source is not None:
+                pan = read_bedgraph(source, {chrom}, 8 << 20).get(chrom)
+        if pan is not None:
+            # `_min_over` binary-searches, so it is only meaningful on runs that
+            # really are sorted and disjoint -- which is itself an invariant of
+            # `max_runs` worth asserting on real data rather than assuming.
+            ok = report.check(
+                len(pan[0]) < 2 or bool((pan[0][1:] >= pan[1][:-1]).all()),
+                "pan-tissue %s on %s is not sorted disjoint runs" % (antigen, chrom))
+            if not ok:
+                pan, failures = None, failures + 1
+
+        rows = rng.choice(len(starts), size=min(per_track, len(starts)),
+                          replace=False)
+        for row in rows.tolist():
+            lo, hi, value = int(starts[row]), int(ends[row]), int(values[row])
+            frame = read.load_window(release, tissue, chrom, lo, hi)
+            hit = frame[(frame["feature_name"] == antigen)
+                        & (frame["End"] > lo) & (frame["Start"] < hi)]
+            stored = int(hit["Name"].max()) if len(hit) else 0
+            intervals += 1
+            if not report.check(
+                    stored >= value,
+                    "%s %s %s:%d-%d -- signal/ says %d, the release stores %d"
+                    % (tissue, antigen, chrom, lo, hi, value, stored)):
+                failures += 1
+
+            if pan is not None:
+                covered = _min_over(pan[0], pan[1], pan[2], lo, hi)
+                pan_intervals += 1
+                if not report.check(
+                        covered >= value,
+                        "%s %s %s:%d-%d is %d, but %r drops to %d over it"
+                        % (tissue, antigen, chrom, lo, hi, value, pan_tissue,
+                           covered)):
+                    failures += 1
+            if failures >= 5:
+                break
+        if failures >= 5:
+            break
+    return {"tracks": tracks, "intervals": intervals,
+            "pan_intervals": pan_intervals, "failed": failures}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, required=True)
@@ -261,6 +384,11 @@ def main(argv=None):
     parser.add_argument("--release", default=None)
     parser.add_argument("--sample", type=int, default=25,
                         help="chunks to re-derive from signal/ and compare; 0 skips")
+    parser.add_argument("--signal-sample", type=int, default=25,
+                        help="tracks to sample intervals FROM signal/ for and "
+                             "look up in the release; 0 skips")
+    parser.add_argument("--per-track", type=int, default=8,
+                        help="intervals sampled per track by --signal-sample")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args(argv)
 
@@ -314,6 +442,16 @@ def main(argv=None):
             json.loads(release.path("features").read_text()).get("aliases"))
         print("  sampled: %(sampled)d chunks re-derived from signal/, "
               "%(mismatched)d mismatched" % summary["sampled"], flush=True)
+
+    if args.signal_sample and release.path("signal_root").is_dir():
+        summary["signal"] = verify_sampled_signal_intervals(
+            release, report, chroms, tissues, features, args.signal_sample,
+            args.seed + 1,
+            json.loads(release.path("features").read_text()).get("aliases"),
+            args.per_track)
+        print("  signal:  %(intervals)d intervals from %(tracks)d tracks "
+              "round-tripped, %(pan_intervals)d checked against the pan-tissue "
+              "track, %(failed)d failed" % summary["signal"], flush=True)
 
     if report.problems:
         print("\n%d problem(s) across %d checks:" % (len(report.problems),

@@ -986,7 +986,6 @@ def test_verify_catches_a_tissue_with_features_but_no_rows(toy, tmp_path):
     ~1,500 features unavailable.
     """
     release = toy["release"]
-    victim = release.omics_chunk("Blood", "chr1")
     saved = {c: release.omics_chunk("Blood", c).read_bytes()
              for c in release.manifest["chrom_sizes"]
              if release.omics_chunk("Blood", c).exists()}
@@ -995,15 +994,17 @@ def test_verify_catches_a_tissue_with_features_but_no_rows(toy, tmp_path):
         for chrom in release.manifest["chrom_sizes"]:
             path = release.omics_chunk("Blood", chrom)
             if path.exists():
-                import pyarrow.parquet as _pq
-                _pq.ParquetWriter(
-                    path, chunks.out_schema().with_metadata(
-                        {chunks.CHUNK_KEY: b"[]"})).close()
+                pq.ParquetWriter(path, chunks.out_schema().with_metadata(
+                    {chunks.CHUNK_KEY: b"[]"})).close()
+        # The reader caches an open handle per path, which is sound because a
+        # release is immutable -- but this test is rewriting one underneath it.
+        read._row_group_index.cache_clear()
         rc = verify.main(["--data-dir", str(toy["data"]), "--org", "toy",
                           "--release", "2026-08", "--sample", "0"])
     finally:
         for chrom, blob in saved.items():
             release.omics_chunk("Blood", chrom).write_bytes(blob)
+        read._row_group_index.cache_clear()
     assert rc == 1, "verify passed a release with a silently empty tissue"
 
 
@@ -1055,6 +1056,168 @@ def test_verify_catches_a_feature_no_file_resolves_to(toy):
         release.availability().write_text(saved)
         release.path("features").write_text(saved_features)
     assert rc == 1, "verify passed a release with an unreachable feature"
+
+
+# --------------------------------------------------------------------------
+# sampling from the bedGraph side
+
+
+def _bedgraph_rows(path):
+    return [(c, int(s), int(e), int(v))
+            for c, s, e, v in (line.split("\t")
+                               for line in path.read_text().splitlines())]
+
+
+def _signal_path(release, tissue, antigen):
+    return (release.path("signal_root")
+            / antigen_class(antigen).replace(" ", "_") / tissue
+            / ("%s.bedgraph" % antigen))
+
+
+def test_every_bedgraph_interval_reads_back_at_no_less_than_its_value(toy):
+    """The round trip, exhaustively on the toy: signal/ in, release out.
+
+    Sampling by *chunk* asks "is what is stored here derivable from signal/",
+    which nothing-versus-nothing satisfies. Sampling by *bedGraph row* asks the
+    question that has a known answer -- this interval exists and scores this
+    much, so the release must report at least that.
+
+    `>=` rather than `==` because `load_window` returns whole peaks and a longer
+    one overlapping the same span may legitimately score higher. What is being
+    ruled out is a value that got lost or shrunk on the way in.
+    """
+    release = toy["release"]
+    for tissue in ("Blood", PAN):
+        for antigen in ANTIGENS[:2]:
+            rows = _bedgraph_rows(_signal_path(release, tissue, antigen))
+            assert rows, "fixture wrote no signal for %s/%s" % (tissue, antigen)
+            for chrom, lo, hi, value in rows:
+                frame = read.load_window(release, tissue, chrom, lo, hi)
+                hit = frame[(frame["feature_name"] == antigen)
+                            & (frame["End"] > lo) & (frame["Start"] < hi)]
+                assert len(hit), ("%s %s %s:%d-%d is in signal/ but the release "
+                                  "has nothing there" % (tissue, antigen, chrom,
+                                                         lo, hi))
+                assert int(hit["Name"].max()) >= value, (
+                    "%s %s %s:%d-%d -- signal/ says %d, release stores %d"
+                    % (tissue, antigen, chrom, lo, hi, value,
+                       int(hit["Name"].max())))
+
+
+def test_the_pan_tissue_never_scores_below_a_contributing_tissue(toy):
+    """Over any per-tissue run, `All cell types` is >= it at every base.
+
+    The `>=` half of the pan-tissue contract, and the half that survives on real
+    data: `test_the_pan_tissue_track_is_the_max_over_every_tissue` compares per
+    base against brute force, which is only affordable on a toy genome. This one
+    is a binary search per interval, so `verify` can run it on hg38.
+    """
+    release = toy["release"]
+    antigen = ANTIGENS[1]
+    pan = {}
+    for chrom, lo, hi, value in _bedgraph_rows(_signal_path(release, PAN, antigen)):
+        pan.setdefault(chrom, []).append((lo, hi, value))
+    pan = {c: np.array(v).T for c, v in pan.items()}
+
+    checked = 0
+    for tissue in TISSUES:
+        for chrom, lo, hi, value in _bedgraph_rows(
+                _signal_path(release, tissue, antigen)):
+            starts, ends, values = pan[chrom]
+            got = verify._min_over(starts, ends, values, lo, hi)
+            assert got >= value, (
+                "%s %s:%d-%d is %d in %s but the pan-tissue track drops to %d"
+                % (antigen, chrom, lo, hi, value, tissue, got))
+            checked += 1
+    assert checked, "nothing was compared"
+
+
+def test_min_over_counts_an_uncovered_base_as_zero():
+    """A hole is the failure, so it must not be skipped over.
+
+    Taking the minimum only of the runs that *are* present would let the
+    survivors vouch for a region nothing covers -- which is exactly what a
+    dropped run in the merge looks like.
+    """
+    starts = np.array([100, 300])
+    ends = np.array([200, 400])
+    values = np.array([50, 60])
+    assert verify._min_over(starts, ends, values, 100, 200) == 50
+    assert verify._min_over(starts, ends, values, 120, 180) == 50
+    assert verify._min_over(starts, ends, values, 150, 350) == 0   # gap 200-300
+    assert verify._min_over(starts, ends, values, 90, 150) == 0    # short at the left
+    assert verify._min_over(starts, ends, values, 350, 450) == 0   # short at the right
+    assert verify._min_over(starts, ends, values, 500, 600) == 0   # nothing at all
+
+
+def _sample_signal(release, tissues, antigen, n=12, seed=0):
+    report = verify.Report()
+    stats = verify.verify_sampled_signal_intervals(
+        release, report, {"chr1": CHROM_SIZES["chr1"]}, tissues, [antigen],
+        n, seed)
+    return report, stats
+
+
+def test_the_interval_sample_catches_a_silently_emptied_tissue(toy):
+    """The slug bug, seen from the bedGraph side.
+
+    `verify_sampled_chunks` cannot see this one -- it re-derives through the
+    same lookup -- and the vocabulary cross-check only catches it because a
+    whole tissue went quiet. Sampling from signal/ catches it per interval,
+    which also covers the case of one feature going missing rather than all.
+    """
+    release = toy["release"]
+    antigen = ANTIGENS[0]
+    path = release.omics_chunk("Blood", "chr1")
+    saved = path.read_bytes()
+    try:
+        report, stats = _sample_signal(release, ["Blood"], antigen)
+        assert stats["intervals"] > 0, "nothing was sampled"
+        assert not report.problems, report.problems[:3]
+
+        pq.ParquetWriter(path, chunks.out_schema().with_metadata(
+            {chunks.CHUNK_KEY: b"[]"})).close()
+        read._row_group_index.cache_clear()      # the file changed under us
+        report, stats = _sample_signal(release, ["Blood"], antigen)
+        assert report.problems, "an emptied tissue passed the interval sample"
+        assert "the release stores 0" in report.problems[0]
+    finally:
+        path.write_bytes(saved)
+        read._row_group_index.cache_clear()
+
+
+def test_the_interval_sample_catches_a_pan_tissue_run_scored_too_low(toy):
+    """A merge that took something other than the maximum.
+
+    Injected on the derived track, which is the artifact that would actually be
+    wrong -- the per-tissue bedGraphs are inputs, so lowering one of those would
+    test nothing.
+    """
+    release = toy["release"]
+    antigen = ANTIGENS[0]
+    path = _signal_path(release, PAN, antigen)
+    saved = path.read_text()
+    try:
+        report, stats = _sample_signal(release, ["Blood", PAN], antigen)
+        assert stats["pan_intervals"] > 0, "the pan-tissue check never ran"
+        assert not report.problems, report.problems[:3]
+
+        # One run demoted to 1, as a merge that dropped a contributor would.
+        lines = saved.splitlines()
+        for i, line in enumerate(lines):
+            chrom, lo, hi, _ = line.split("\t")
+            if chrom == "chr1" and int(hi) - int(lo) > 500:
+                lines[i] = "%s\t%s\t%s\t1" % (chrom, lo, hi)
+                break
+        else:
+            pytest.fail("fixture has no run long enough to demote")
+        path.write_text("\n".join(lines) + "\n")
+
+        report, _ = _sample_signal(release, ["Blood", PAN], antigen)
+        assert report.problems, "a demoted pan-tissue run passed the check"
+        assert "drops to 1" in "\n".join(report.problems)
+    finally:
+        path.write_text(saved)
 
 
 # --------------------------------------------------------------------------
